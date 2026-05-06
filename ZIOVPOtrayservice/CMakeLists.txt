@@ -12,30 +12,29 @@ add_custom_command(
   VERBATIM
 )
 
-add_executable(ZIOVPOtrayapp WIN32
-  "ZIOVPOtrayapp.cpp"
-  "ZIOVPOtrayapp.h"
+add_executable(ZIOVPOtrayservice
+  "ZIOVPOtrayservice.cpp"
+  "ZIOVPOtrayservice.h"
   "${RPC_HEADER}"
-  "${RPC_CLIENT_STUB}"
+  "${RPC_SERVER_STUB}"
 )
 
 if (CMAKE_VERSION VERSION_GREATER 3.12)
-  set_property(TARGET ZIOVPOtrayapp PROPERTY CXX_STANDARD 20)
+  set_property(TARGET ZIOVPOtrayservice PROPERTY CXX_STANDARD 20)
 endif()
 
-target_compile_definitions(ZIOVPOtrayapp PRIVATE UNICODE _UNICODE)
-target_include_directories(ZIOVPOtrayapp PRIVATE "${RPC_OUTPUT_DIR}")
+target_compile_definitions(ZIOVPOtrayservice PRIVATE UNICODE _UNICODE)
+target_include_directories(ZIOVPOtrayservice PRIVATE "${RPC_OUTPUT_DIR}")
 
 if (MSVC)
-  target_compile_options(ZIOVPOtrayapp PRIVATE /utf-8)
+  target_compile_options(ZIOVPOtrayservice PRIVATE /utf-8)
 endif()
 
-target_link_libraries(ZIOVPOtrayapp PRIVATE
+target_link_libraries(ZIOVPOtrayservice PRIVATE
   advapi32
   rpcrt4
-  user32
-  shell32
-  gdi32
+  userenv
+  wtsapi32
 )
 
-install(TARGETS ZIOVPOtrayapp RUNTIME DESTINATION .)
+install(TARGETS ZIOVPOtrayservice RUNTIME DESTINATION .)

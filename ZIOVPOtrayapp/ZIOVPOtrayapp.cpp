@@ -1,5 +1,9 @@
 #include "ZIOVPOtrayapp.h"
+#include "ZIOVPOTrayRpc.h"
 
+#include <algorithm>
+#include <cstdlib>
+#include <cwctype>
 #include <string>
 
 namespace
@@ -12,6 +16,9 @@ constexpr UINT TRAY_ICON_ID = 1;
 
 const wchar_t kWindowClassName[] = L"ZIOVPOTrayAppWindowClass";
 const wchar_t kMutexName[] = L"Local\\ZIOVPOTrayAppSingleInstance";
+const wchar_t kServiceName[] = L"ZIOVPOTrayService";
+const wchar_t kServiceProcessName[] = L"ziovpotrayservice.exe";
+const wchar_t kRpcEndpoint[] = L"ZIOVPOTrayServiceRpc";
 
 HINSTANCE g_instance = nullptr;
 HWND g_mainWindow = nullptr;
@@ -19,6 +26,139 @@ HMENU g_mainMenu = nullptr;
 HMENU g_fileMenu = nullptr;
 UINT g_taskbarCreatedMessage = 0;
 bool g_isExiting = false;
+
+std::wstring ToLower(std::wstring value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t character) {
+        return static_cast<wchar_t>(towlower(character));
+    });
+    return value;
+}
+
+std::wstring FileNameFromPath(const std::wstring& path)
+{
+    const size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? path : path.substr(slash + 1);
+}
+
+DWORD GetParentProcessId()
+{
+    const DWORD currentProcessId = GetCurrentProcessId();
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE)
+    {
+        return 0;
+    }
+
+    PROCESSENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+    DWORD parentProcessId = 0;
+
+    if (Process32First(snapshot, &entry))
+    {
+        do
+        {
+            if (entry.th32ProcessID == currentProcessId)
+            {
+                parentProcessId = entry.th32ParentProcessID;
+                break;
+            }
+        } while (Process32Next(snapshot, &entry));
+    }
+
+    CloseHandle(snapshot);
+    return parentProcessId;
+}
+
+bool IsStartedByService()
+{
+    const DWORD parentProcessId = GetParentProcessId();
+    if (parentProcessId == 0)
+    {
+        return false;
+    }
+
+    HANDLE parentProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parentProcessId);
+    if (!parentProcess)
+    {
+        return false;
+    }
+
+    wchar_t parentPath[MAX_PATH]{};
+    DWORD parentPathSize = ARRAYSIZE(parentPath);
+    const bool queried = QueryFullProcessImageNameW(parentProcess, 0, parentPath, &parentPathSize) != FALSE;
+    CloseHandle(parentProcess);
+
+    if (!queried)
+    {
+        return false;
+    }
+
+    return ToLower(FileNameFromPath(parentPath)) == kServiceProcessName;
+}
+
+bool WaitForServiceState(SC_HANDLE service, DWORD expectedState, DWORD timeoutMs)
+{
+    const DWORD startedAt = GetTickCount();
+    SERVICE_STATUS_PROCESS status{};
+    DWORD bytesNeeded = 0;
+
+    do
+    {
+        if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&status), sizeof(status), &bytesNeeded))
+        {
+            return false;
+        }
+
+        if (status.dwCurrentState == expectedState)
+        {
+            return true;
+        }
+
+        Sleep(250);
+    } while (GetTickCount() - startedAt < timeoutMs);
+
+    return false;
+}
+
+bool EnsureServiceRunningAndExitIfStarted()
+{
+    SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!manager)
+    {
+        return false;
+    }
+
+    SC_HANDLE service = OpenServiceW(manager, kServiceName, SERVICE_QUERY_STATUS | SERVICE_START);
+    if (!service)
+    {
+        CloseServiceHandle(manager);
+        return false;
+    }
+
+    SERVICE_STATUS_PROCESS status{};
+    DWORD bytesNeeded = 0;
+    bool shouldExit = false;
+
+    if (QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&status), sizeof(status), &bytesNeeded))
+    {
+        if (status.dwCurrentState == SERVICE_STOPPED)
+        {
+            StartServiceW(service, 0, nullptr);
+            WaitForServiceState(service, SERVICE_RUNNING, 30000);
+            shouldExit = true;
+        }
+        else if (status.dwCurrentState == SERVICE_START_PENDING)
+        {
+            WaitForServiceState(service, SERVICE_RUNNING, 30000);
+            shouldExit = true;
+        }
+    }
+
+    CloseServiceHandle(service);
+    CloseServiceHandle(manager);
+    return shouldExit;
+}
 
 bool IsHiddenStartupMode()
 {
@@ -63,6 +203,48 @@ void AddTrayIcon()
     Shell_NotifyIcon(NIM_ADD, &data);
     data.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIcon(NIM_SETVERSION, &data);
+}
+
+bool RequestServiceStop()
+{
+    RPC_WSTR bindingString = nullptr;
+    handle_t binding = nullptr;
+    RPC_STATUS status = RpcStringBindingComposeW(
+        nullptr,
+        reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(L"ncalrpc")),
+        nullptr,
+        reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(kRpcEndpoint)),
+        nullptr,
+        &bindingString);
+
+    if (status == RPC_S_OK)
+    {
+        status = RpcBindingFromStringBindingW(bindingString, &binding);
+    }
+
+    if (bindingString)
+    {
+        RpcStringFreeW(&bindingString);
+    }
+
+    if (status != RPC_S_OK)
+    {
+        return false;
+    }
+
+    RpcTryExcept
+    {
+        RpcStopService(binding);
+        status = RPC_S_OK;
+    }
+    RpcExcept(1)
+    {
+        status = RpcExceptionCode();
+    }
+    RpcEndExcept
+
+    RpcBindingFree(&binding);
+    return status == RPC_S_OK;
 }
 
 void ExitApplication()
@@ -137,7 +319,10 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
             return 0;
         case ID_TRAY_EXIT:
         case ID_FILE_EXIT:
-            ExitApplication();
+            if (!RequestServiceStop())
+            {
+                ExitApplication();
+            }
             return 0;
         default:
             return 0;
@@ -205,6 +390,16 @@ bool CreateMainWindow()
 
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
 {
+    if (EnsureServiceRunningAndExitIfStarted())
+    {
+        return 0;
+    }
+
+    if (!IsStartedByService())
+    {
+        return 0;
+    }
+
     HANDLE singleInstanceMutex = CreateMutex(nullptr, TRUE, kMutexName);
     if (!singleInstanceMutex || GetLastError() == ERROR_ALREADY_EXISTS)
     {
@@ -240,4 +435,14 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
 
     CloseHandle(singleInstanceMutex);
     return static_cast<int>(message.wParam);
+}
+
+void* __RPC_USER midl_user_allocate(size_t size)
+{
+    return malloc(size);
+}
+
+void __RPC_USER midl_user_free(void* pointer)
+{
+    free(pointer);
 }
