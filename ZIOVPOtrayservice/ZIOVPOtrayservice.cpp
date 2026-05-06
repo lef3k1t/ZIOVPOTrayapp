@@ -477,6 +477,32 @@ void ClearAccountLocked()
     SetEvent(g_refreshEvent);
 }
 
+void EnablePrivilege(const wchar_t* privilegeName)
+{
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+    {
+        return;
+    }
+
+    TOKEN_PRIVILEGES privileges{};
+    privileges.PrivilegeCount = 1;
+    if (LookupPrivilegeValueW(nullptr, privilegeName, &privileges.Privileges[0].Luid))
+    {
+        privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        AdjustTokenPrivileges(token, FALSE, &privileges, sizeof(privileges), nullptr, nullptr);
+    }
+
+    CloseHandle(token);
+}
+
+void EnableProcessCreationPrivileges()
+{
+    EnablePrivilege(SE_ASSIGNPRIMARYTOKEN_NAME);
+    EnablePrivilege(SE_INCREASE_QUOTA_NAME);
+    EnablePrivilege(SE_TCB_NAME);
+}
+
 void SetServiceState(DWORD state, DWORD win32ExitCode = NO_ERROR, DWORD waitHint = 0)
 {
     g_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
@@ -551,7 +577,7 @@ void StartTrayForSession(DWORD sessionId)
     }
 
     HANDLE primaryToken = nullptr;
-    if (!DuplicateTokenEx(userToken, MAXIMUM_ALLOWED, nullptr, SecurityIdentification, TokenPrimary, &primaryToken))
+    if (!DuplicateTokenEx(userToken, MAXIMUM_ALLOWED, nullptr, SecurityImpersonation, TokenPrimary, &primaryToken))
     {
         CloseHandle(userToken);
         return;
@@ -608,13 +634,19 @@ void StartTrayForActiveSessions()
 
     for (DWORD index = 0; index < sessionCount; ++index)
     {
-        if (sessions[index].SessionId != 0 && sessions[index].State == WTSActive)
+        if (sessions[index].SessionId != 0 && (sessions[index].State == WTSActive || sessions[index].State == WTSConnected))
         {
             StartTrayForSession(sessions[index].SessionId);
         }
     }
 
     WTSFreeMemory(sessions);
+
+    const DWORD consoleSessionId = WTSGetActiveConsoleSessionId();
+    if (consoleSessionId != 0 && consoleSessionId != 0xFFFFFFFF)
+    {
+        StartTrayForSession(consoleSessionId);
+    }
 }
 
 void StopAllTrayProcesses()
@@ -731,6 +763,7 @@ void WINAPI ServiceMain(DWORD, LPWSTR*)
     }
 
     SetServiceState(SERVICE_START_PENDING, NO_ERROR, 3000);
+    EnableProcessCreationPrivileges();
     InitializeCriticalSection(&g_processLock);
     InitializeCriticalSection(&g_accountLock);
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
