@@ -1,0 +1,15 @@
+.vs/
+out/
+build/
+build-*/
+artifact/
+
+*.user
+*.suo
+*.VC.db
+*.VC.db-shm
+*.VC.db-wal
+*.obj
+*.pdb
+*.ilk
+*.exe
