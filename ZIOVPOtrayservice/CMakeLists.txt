@@ -32,8 +32,11 @@ endif()
 
 target_link_libraries(ZIOVPOtrayservice PRIVATE
   advapi32
+  crypt32
+  iphlpapi
   rpcrt4
   userenv
+  winhttp
   wtsapi32
 )
 

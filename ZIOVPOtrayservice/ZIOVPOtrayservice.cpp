@@ -2,21 +2,479 @@
 #include "ZIOVPOTrayRpc.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cctype>
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <winhttp.h>
 
 namespace
 {
 const wchar_t kServiceName[] = L"ZIOVPOTrayService";
 const wchar_t kRpcEndpoint[] = L"ZIOVPOTrayServiceRpc";
 const wchar_t kTrayProcessName[] = L"ZIOVPOtrayapp.exe";
+const DWORD kNotAuthenticated = 12001;
+const DWORD kNoLicense = 12002;
+const DWORD kServerRequestFailed = 12003;
 
 SERVICE_STATUS_HANDLE g_statusHandle = nullptr;
 SERVICE_STATUS g_status{};
 HANDLE g_stopEvent = nullptr;
+HANDLE g_refreshEvent = nullptr;
 CRITICAL_SECTION g_processLock{};
+CRITICAL_SECTION g_accountLock{};
 std::vector<PROCESS_INFORMATION> g_trayProcesses;
+
+struct AccountState
+{
+    bool authenticated = false;
+    std::wstring userName;
+    std::wstring accessToken;
+    std::wstring refreshToken;
+    ULONGLONG accessExpiresAt = 0;
+    ULONGLONG refreshExpiresAt = 0;
+    bool licenseActive = false;
+    std::wstring licenseTicket;
+    std::wstring licenseExpiresAtText;
+    ULONGLONG licenseRefreshAt = 0;
+};
+
+AccountState g_account;
+
+std::wstring GetEnvOrDefault(const wchar_t* name, const wchar_t* fallback)
+{
+    wchar_t value[1024]{};
+    const DWORD length = GetEnvironmentVariableW(name, value, ARRAYSIZE(value));
+    return length > 0 && length < ARRAYSIZE(value) ? value : fallback;
+}
+
+std::wstring LoginUrl()
+{
+    return GetEnvOrDefault(L"ZIOVPO_AUTH_LOGIN_URL", L"https://localhost:8443/auth/login");
+}
+
+std::wstring RefreshUrl()
+{
+    return GetEnvOrDefault(L"ZIOVPO_AUTH_REFRESH_URL", L"https://localhost:8443/auth/refresh");
+}
+
+std::wstring LicenseStatusUrl()
+{
+    return GetEnvOrDefault(L"ZIOVPO_LICENSE_STATUS_URL", L"https://localhost:8443/license/check");
+}
+
+std::wstring ActivationUrl()
+{
+    return GetEnvOrDefault(L"ZIOVPO_LICENSE_ACTIVATE_URL", L"https://localhost:8443/license/activate");
+}
+
+std::string Narrow(const std::wstring& value)
+{
+    if (value.empty())
+    {
+        return {};
+    }
+
+    const int size = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    std::string result(size > 0 ? size - 1 : 0, '\0');
+    if (size > 0)
+    {
+        WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, result.data(), size, nullptr, nullptr);
+    }
+    return result;
+}
+
+std::wstring Widen(const std::string& value)
+{
+    if (value.empty())
+    {
+        return {};
+    }
+
+    const int size = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, nullptr, 0);
+    std::wstring result(size > 0 ? size - 1 : 0, L'\0');
+    if (size > 0)
+    {
+        MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, result.data(), size);
+    }
+    return result;
+}
+
+std::string JsonEscape(const std::wstring& value)
+{
+    std::string source = Narrow(value);
+    std::string result;
+    result.reserve(source.size());
+    for (char character : source)
+    {
+        if (character == '\\' || character == '"')
+        {
+            result.push_back('\\');
+        }
+        result.push_back(character);
+    }
+    return result;
+}
+
+long long JsonNumber(const std::string& json, const std::string& name);
+
+std::string Base64UrlToJsonPart(std::string value)
+{
+    std::replace(value.begin(), value.end(), '-', '+');
+    std::replace(value.begin(), value.end(), '_', '/');
+    while (value.size() % 4 != 0)
+    {
+        value.push_back('=');
+    }
+
+    DWORD decodedSize = 0;
+    if (!CryptStringToBinaryA(value.c_str(), static_cast<DWORD>(value.size()), CRYPT_STRING_BASE64, nullptr, &decodedSize, nullptr, nullptr))
+    {
+        return {};
+    }
+
+    std::string decoded(decodedSize, '\0');
+    if (!CryptStringToBinaryA(value.c_str(), static_cast<DWORD>(value.size()), CRYPT_STRING_BASE64, reinterpret_cast<BYTE*>(decoded.data()), &decodedSize, nullptr, nullptr))
+    {
+        return {};
+    }
+    decoded.resize(decodedSize);
+    return decoded;
+}
+
+ULONGLONG JwtExpiresAtMs(const std::wstring& token, ULONGLONG fallback)
+{
+    const std::string narrowToken = Narrow(token);
+    const size_t firstDot = narrowToken.find('.');
+    const size_t secondDot = firstDot == std::string::npos ? std::string::npos : narrowToken.find('.', firstDot + 1);
+    if (firstDot == std::string::npos || secondDot == std::string::npos)
+    {
+        return fallback;
+    }
+
+    const std::string payload = Base64UrlToJsonPart(narrowToken.substr(firstDot + 1, secondDot - firstDot - 1));
+    const long long expSeconds = JsonNumber(payload, "exp");
+    if (expSeconds <= 0)
+    {
+        return fallback;
+    }
+
+    return static_cast<ULONGLONG>(expSeconds) * 1000;
+}
+
+std::string JsonString(const std::string& json, const std::string& name)
+{
+    const std::string key = "\"" + name + "\"";
+    size_t position = json.find(key);
+    if (position == std::string::npos)
+    {
+        return {};
+    }
+
+    position = json.find(':', position + key.size());
+    if (position == std::string::npos)
+    {
+        return {};
+    }
+
+    position = json.find('"', position + 1);
+    if (position == std::string::npos)
+    {
+        return {};
+    }
+
+    std::string result;
+    for (++position; position < json.size(); ++position)
+    {
+        if (json[position] == '"' && json[position - 1] != '\\')
+        {
+            break;
+        }
+        result.push_back(json[position]);
+    }
+    return result;
+}
+
+long long JsonNumber(const std::string& json, const std::string& name)
+{
+    const std::string key = "\"" + name + "\"";
+    size_t position = json.find(key);
+    if (position == std::string::npos)
+    {
+        return 0;
+    }
+
+    position = json.find(':', position + key.size());
+    if (position == std::string::npos)
+    {
+        return 0;
+    }
+
+    while (++position < json.size() && isspace(static_cast<unsigned char>(json[position])))
+    {
+    }
+
+    return _strtoi64(json.c_str() + position, nullptr, 10);
+}
+
+bool JsonBool(const std::string& json, const std::string& name)
+{
+    const std::string key = "\"" + name + "\"";
+    size_t position = json.find(key);
+    if (position == std::string::npos)
+    {
+        return false;
+    }
+
+    position = json.find(':', position + key.size());
+    return position != std::string::npos && json.find("true", position) != std::string::npos;
+}
+
+ULONGLONG NowMs()
+{
+    return GetTickCount64();
+}
+
+ULONGLONG SecondsFromNow(long long seconds)
+{
+    return NowMs() + static_cast<ULONGLONG>(std::max<long long>(seconds, 60)) * 1000;
+}
+
+std::wstring GetDeviceName()
+{
+    wchar_t name[MAX_COMPUTERNAME_LENGTH + 1]{};
+    DWORD size = ARRAYSIZE(name);
+    return GetComputerNameW(name, &size) ? std::wstring(name, size) : L"WindowsDevice";
+}
+
+std::wstring GetDeviceMac()
+{
+    ULONG bufferSize = 16 * 1024;
+    std::vector<BYTE> buffer(bufferSize);
+    auto addresses = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+    if (GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, nullptr, addresses, &bufferSize) == ERROR_BUFFER_OVERFLOW)
+    {
+        buffer.resize(bufferSize);
+        addresses = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+    }
+
+    if (GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, nullptr, addresses, &bufferSize) != NO_ERROR)
+    {
+        return L"00-00-00-00-00-00";
+    }
+
+    for (IP_ADAPTER_ADDRESSES* adapter = addresses; adapter; adapter = adapter->Next)
+    {
+        if (adapter->PhysicalAddressLength == 0 || adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
+        {
+            continue;
+        }
+
+        wchar_t mac[32]{};
+        swprintf_s(
+            mac,
+            L"%02X-%02X-%02X-%02X-%02X-%02X",
+            adapter->PhysicalAddress[0],
+            adapter->PhysicalAddress[1],
+            adapter->PhysicalAddress[2],
+            adapter->PhysicalAddress[3],
+            adapter->PhysicalAddress[4],
+            adapter->PhysicalAddress[5]);
+        return mac;
+    }
+
+    return L"00-00-00-00-00-00";
+}
+
+std::string LicenseCheckBody()
+{
+    return "{\"deviceMac\":\"" + JsonEscape(GetDeviceMac()) + "\",\"productId\":1}";
+}
+
+std::string LicenseActivationBody(const wchar_t* activationCode)
+{
+    return "{\"activationKey\":\"" + JsonEscape(activationCode ? activationCode : L"") +
+        "\",\"deviceMac\":\"" + JsonEscape(GetDeviceMac()) +
+        "\",\"deviceName\":\"" + JsonEscape(GetDeviceName()) + "\"}";
+}
+
+struct HttpResponse
+{
+    DWORD statusCode = 0;
+    std::string body;
+};
+
+bool SendHttpsJson(const std::wstring& url, const wchar_t* method, const std::string& body, const std::wstring& bearerToken, HttpResponse& response)
+{
+    URL_COMPONENTS components{};
+    components.dwStructSize = sizeof(components);
+    components.dwSchemeLength = static_cast<DWORD>(-1);
+    components.dwHostNameLength = static_cast<DWORD>(-1);
+    components.dwUrlPathLength = static_cast<DWORD>(-1);
+    components.dwExtraInfoLength = static_cast<DWORD>(-1);
+
+    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &components))
+    {
+        return false;
+    }
+
+    std::wstring host(components.lpszHostName, components.dwHostNameLength);
+    std::wstring path(components.lpszUrlPath, components.dwUrlPathLength);
+    if (components.dwExtraInfoLength > 0)
+    {
+        path.append(components.lpszExtraInfo, components.dwExtraInfoLength);
+    }
+
+    HINTERNET session = WinHttpOpen(L"ZIOVPOTrayService/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session)
+    {
+        return false;
+    }
+
+    HINTERNET connection = WinHttpConnect(session, host.c_str(), components.nPort, 0);
+    HINTERNET request = connection ? WinHttpOpenRequest(connection, method, path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : nullptr;
+    if (request && host == L"localhost")
+    {
+        DWORD securityFlags =
+            SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+            SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+            SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+            SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+        WinHttpSetOption(request, WINHTTP_OPTION_SECURITY_FLAGS, &securityFlags, sizeof(securityFlags));
+    }
+
+    std::wstring headers = L"Content-Type: application/json\r\n";
+    if (!bearerToken.empty())
+    {
+        headers += L"Authorization: Bearer " + bearerToken + L"\r\n";
+    }
+
+    const BOOL sent = request && WinHttpSendRequest(
+        request,
+        headers.c_str(),
+        static_cast<DWORD>(headers.size()),
+        body.empty() ? WINHTTP_NO_REQUEST_DATA : const_cast<char*>(body.data()),
+        static_cast<DWORD>(body.size()),
+        static_cast<DWORD>(body.size()),
+        0);
+
+    bool ok = false;
+    if (sent && WinHttpReceiveResponse(request, nullptr))
+    {
+        DWORD statusCode = 0;
+        DWORD statusCodeSize = sizeof(statusCode);
+        WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusCodeSize, WINHTTP_NO_HEADER_INDEX);
+        response.statusCode = statusCode;
+
+        DWORD available = 0;
+        while (WinHttpQueryDataAvailable(request, &available) && available > 0)
+        {
+            std::string chunk(available, '\0');
+            DWORD read = 0;
+            if (!WinHttpReadData(request, chunk.data(), available, &read))
+            {
+                break;
+            }
+            chunk.resize(read);
+            response.body += chunk;
+        }
+
+        ok = statusCode >= 200 && statusCode < 300;
+    }
+
+    if (request)
+    {
+        WinHttpCloseHandle(request);
+    }
+    if (connection)
+    {
+        WinHttpCloseHandle(connection);
+    }
+    WinHttpCloseHandle(session);
+    return ok;
+}
+
+void CopyRpcString(wchar_t* destination, unsigned long destinationChars, const std::wstring& value)
+{
+    if (!destination || destinationChars == 0)
+    {
+        return;
+    }
+
+    wcsncpy_s(destination, destinationChars, value.c_str(), _TRUNCATE);
+}
+
+bool UpdateLicenseStatusLocked()
+{
+    if (!g_account.authenticated || g_account.accessToken.empty())
+    {
+        g_account.licenseActive = false;
+        g_account.licenseTicket.clear();
+        return false;
+    }
+
+    HttpResponse response{};
+    if (!SendHttpsJson(LicenseStatusUrl(), L"POST", LicenseCheckBody(), g_account.accessToken, response))
+    {
+        return false;
+    }
+
+    g_account.licenseTicket = Widen(response.body);
+    g_account.licenseActive = !JsonBool(response.body, "licenseBlocked") && !JsonString(response.body, "licenseEndingDate").empty();
+    g_account.licenseExpiresAtText = Widen(JsonString(response.body, "licenseEndingDate"));
+    if (g_account.licenseExpiresAtText.empty())
+    {
+        g_account.licenseExpiresAtText = Widen(JsonString(response.body, "expiresAt"));
+    }
+    if (g_account.licenseExpiresAtText.empty())
+    {
+        g_account.licenseExpiresAtText = Widen(JsonString(response.body, "expires_at"));
+    }
+
+    const long long refreshInSeconds = JsonNumber(response.body, "ticketTtlSeconds");
+    const long long expiresInSeconds = JsonNumber(response.body, "expiresIn");
+    g_account.licenseRefreshAt = SecondsFromNow(refreshInSeconds > 0 ? refreshInSeconds : std::max<long long>(expiresInSeconds / 2, 300));
+    return g_account.licenseActive;
+}
+
+bool RefreshTokensLocked()
+{
+    if (!g_account.authenticated || g_account.refreshToken.empty())
+    {
+        return false;
+    }
+
+    const std::string body = "{\"refreshToken\":\"" + JsonEscape(g_account.refreshToken) + "\"}";
+    HttpResponse response{};
+    if (!SendHttpsJson(RefreshUrl(), L"POST", body, {}, response))
+    {
+        return false;
+    }
+
+    const std::wstring accessToken = Widen(JsonString(response.body, "accessToken"));
+    const std::wstring refreshToken = Widen(JsonString(response.body, "refreshToken"));
+    if (!accessToken.empty())
+    {
+        g_account.accessToken = accessToken;
+    }
+    if (!refreshToken.empty())
+    {
+        g_account.refreshToken = refreshToken;
+    }
+
+    const long long accessExpiresIn = JsonNumber(response.body, "accessExpiresIn");
+    const long long refreshExpiresIn = JsonNumber(response.body, "refreshExpiresIn");
+    g_account.accessExpiresAt = JwtExpiresAtMs(g_account.accessToken, SecondsFromNow(accessExpiresIn > 0 ? accessExpiresIn : 900));
+    g_account.refreshExpiresAt = JwtExpiresAtMs(g_account.refreshToken, SecondsFromNow(refreshExpiresIn > 0 ? refreshExpiresIn : 86400));
+    return true;
+}
+
+void ClearAccountLocked()
+{
+    g_account = AccountState{};
+    SetEvent(g_refreshEvent);
+}
 
 void SetServiceState(DWORD state, DWORD win32ExitCode = NO_ERROR, DWORD waitHint = 0)
 {
@@ -184,6 +642,33 @@ DWORD WINAPI SessionMonitorThread(void*)
     return 0;
 }
 
+DWORD WINAPI AccountRefreshThread(void*)
+{
+    while (WaitForSingleObject(g_stopEvent, 1000) == WAIT_TIMEOUT)
+    {
+        EnterCriticalSection(&g_accountLock);
+        const bool authenticated = g_account.authenticated;
+        const bool hasLicenseTicket = !g_account.licenseTicket.empty();
+        const ULONGLONG now = NowMs();
+        const bool refreshToken = authenticated && g_account.accessExpiresAt > 0 && now + 60000 >= g_account.accessExpiresAt;
+        const bool refreshLicense = authenticated && hasLicenseTicket && g_account.licenseRefreshAt > 0 && now >= g_account.licenseRefreshAt;
+
+        if (refreshToken)
+        {
+            RefreshTokensLocked();
+        }
+        if (refreshLicense)
+        {
+            UpdateLicenseStatusLocked();
+        }
+        LeaveCriticalSection(&g_accountLock);
+
+        WaitForSingleObject(g_refreshEvent, 30000);
+        ResetEvent(g_refreshEvent);
+    }
+    return 0;
+}
+
 DWORD WINAPI RpcServerThread(void*)
 {
     RPC_STATUS status = RpcServerUseProtseqEpW(
@@ -246,16 +731,20 @@ void WINAPI ServiceMain(DWORD, LPWSTR*)
 
     SetServiceState(SERVICE_START_PENDING, NO_ERROR, 3000);
     InitializeCriticalSection(&g_processLock);
+    InitializeCriticalSection(&g_accountLock);
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!g_stopEvent)
+    g_refreshEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_stopEvent || !g_refreshEvent)
     {
         SetServiceState(SERVICE_STOPPED, GetLastError());
         DeleteCriticalSection(&g_processLock);
+        DeleteCriticalSection(&g_accountLock);
         return;
     }
 
     HANDLE rpcThread = CreateThread(nullptr, 0, RpcServerThread, nullptr, 0, nullptr);
     HANDLE monitorThread = CreateThread(nullptr, 0, SessionMonitorThread, nullptr, 0, nullptr);
+    HANDLE accountThread = CreateThread(nullptr, 0, AccountRefreshThread, nullptr, 0, nullptr);
 
     StartTrayForActiveSessions();
     SetServiceState(SERVICE_RUNNING);
@@ -276,8 +765,16 @@ void WINAPI ServiceMain(DWORD, LPWSTR*)
         CloseHandle(monitorThread);
     }
 
+    if (accountThread)
+    {
+        WaitForSingleObject(accountThread, 5000);
+        CloseHandle(accountThread);
+    }
+
     StopAllTrayProcesses();
+    CloseHandle(g_refreshEvent);
     CloseHandle(g_stopEvent);
+    DeleteCriticalSection(&g_accountLock);
     DeleteCriticalSection(&g_processLock);
     SetServiceState(SERVICE_STOPPED);
 }
@@ -286,6 +783,125 @@ void WINAPI ServiceMain(DWORD, LPWSTR*)
 void RpcStopService(handle_t)
 {
     RpcMgmtStopServerListening(nullptr);
+}
+
+error_status_t RpcGetCurrentUser(handle_t, int* authenticated, wchar_t* userName, unsigned long userNameChars)
+{
+    EnterCriticalSection(&g_accountLock);
+    *authenticated = g_account.authenticated ? 1 : 0;
+    CopyRpcString(userName, userNameChars, g_account.authenticated ? g_account.userName : L"");
+    LeaveCriticalSection(&g_accountLock);
+    return RPC_S_OK;
+}
+
+error_status_t RpcLogin(handle_t, const wchar_t* userName, const wchar_t* password, int* authenticated)
+{
+    *authenticated = 0;
+    const std::string body = "{\"email\":\"" + JsonEscape(userName ? userName : L"") + "\",\"password\":\"" + JsonEscape(password ? password : L"") + "\"}";
+    HttpResponse response{};
+    if (!SendHttpsJson(LoginUrl(), L"POST", body, {}, response))
+    {
+        return kServerRequestFailed;
+    }
+
+    const std::wstring accessToken = Widen(JsonString(response.body, "accessToken"));
+    const std::wstring refreshToken = Widen(JsonString(response.body, "refreshToken"));
+    if (accessToken.empty() || refreshToken.empty())
+    {
+        return kNotAuthenticated;
+    }
+
+    EnterCriticalSection(&g_accountLock);
+    g_account.authenticated = true;
+    g_account.userName = userName ? userName : L"";
+    g_account.accessToken = accessToken;
+    g_account.refreshToken = refreshToken;
+    g_account.accessExpiresAt = JwtExpiresAtMs(g_account.accessToken, SecondsFromNow(JsonNumber(response.body, "accessExpiresIn") > 0 ? JsonNumber(response.body, "accessExpiresIn") : 900));
+    g_account.refreshExpiresAt = JwtExpiresAtMs(g_account.refreshToken, SecondsFromNow(JsonNumber(response.body, "refreshExpiresIn") > 0 ? JsonNumber(response.body, "refreshExpiresIn") : 86400));
+    g_account.licenseActive = false;
+    g_account.licenseTicket.clear();
+    UpdateLicenseStatusLocked();
+    LeaveCriticalSection(&g_accountLock);
+
+    SetEvent(g_refreshEvent);
+    *authenticated = 1;
+    return RPC_S_OK;
+}
+
+void RpcLogout(handle_t)
+{
+    EnterCriticalSection(&g_accountLock);
+    ClearAccountLocked();
+    LeaveCriticalSection(&g_accountLock);
+}
+
+error_status_t RpcGetLicenseInfo(handle_t, int* active, wchar_t* expiresAtUtc, unsigned long expiresAtChars)
+{
+    EnterCriticalSection(&g_accountLock);
+    if (!g_account.authenticated)
+    {
+        *active = 0;
+        CopyRpcString(expiresAtUtc, expiresAtChars, L"");
+        LeaveCriticalSection(&g_accountLock);
+        return kNotAuthenticated;
+    }
+
+    if (g_account.licenseTicket.empty())
+    {
+        UpdateLicenseStatusLocked();
+    }
+
+    *active = g_account.licenseActive ? 1 : 0;
+    CopyRpcString(expiresAtUtc, expiresAtChars, g_account.licenseExpiresAtText);
+    const error_status_t result = g_account.licenseActive ? RPC_S_OK : kNoLicense;
+    LeaveCriticalSection(&g_accountLock);
+    return result;
+}
+
+error_status_t RpcActivateProduct(handle_t, const wchar_t* activationCode, int* active, wchar_t* expiresAtUtc, unsigned long expiresAtChars)
+{
+    *active = 0;
+    EnterCriticalSection(&g_accountLock);
+    if (!g_account.authenticated)
+    {
+        CopyRpcString(expiresAtUtc, expiresAtChars, L"");
+        LeaveCriticalSection(&g_accountLock);
+        return kNotAuthenticated;
+    }
+
+    const std::string body = LicenseActivationBody(activationCode);
+    HttpResponse response{};
+    if (!SendHttpsJson(ActivationUrl(), L"POST", body, g_account.accessToken, response))
+    {
+        LeaveCriticalSection(&g_accountLock);
+        return kServerRequestFailed;
+    }
+
+    if (!response.body.empty() && (!JsonString(response.body, "licenseEndingDate").empty() || !JsonString(response.body, "signature").empty()))
+    {
+        g_account.licenseTicket = Widen(response.body);
+        g_account.licenseActive = !JsonBool(response.body, "licenseBlocked") && !JsonString(response.body, "licenseEndingDate").empty();
+        g_account.licenseExpiresAtText = Widen(JsonString(response.body, "licenseEndingDate"));
+        if (g_account.licenseExpiresAtText.empty())
+        {
+            g_account.licenseExpiresAtText = Widen(JsonString(response.body, "expiresAt"));
+        }
+        if (g_account.licenseExpiresAtText.empty())
+        {
+            g_account.licenseExpiresAtText = Widen(JsonString(response.body, "expires_at"));
+        }
+        g_account.licenseRefreshAt = SecondsFromNow(std::max<long long>(JsonNumber(response.body, "ticketTtlSeconds"), 300));
+    }
+    else
+    {
+        UpdateLicenseStatusLocked();
+    }
+
+    *active = g_account.licenseActive ? 1 : 0;
+    CopyRpcString(expiresAtUtc, expiresAtChars, g_account.licenseExpiresAtText);
+    const error_status_t result = g_account.licenseActive ? RPC_S_OK : kNoLicense;
+    LeaveCriticalSection(&g_accountLock);
+    return result;
 }
 
 void* __RPC_USER midl_user_allocate(size_t size)

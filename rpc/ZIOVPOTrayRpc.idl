@@ -5,4 +5,30 @@
 interface ZIOVPOTrayRpc
 {
     void RpcStopService([in] handle_t binding);
+    error_status_t RpcGetCurrentUser(
+        [in] handle_t binding,
+        [out] int* authenticated,
+        [out, string, size_is(userNameChars)] wchar_t* userName,
+        [in] unsigned long userNameChars);
+
+    error_status_t RpcLogin(
+        [in] handle_t binding,
+        [in, string] const wchar_t* userName,
+        [in, string] const wchar_t* password,
+        [out] int* authenticated);
+
+    void RpcLogout([in] handle_t binding);
+
+    error_status_t RpcGetLicenseInfo(
+        [in] handle_t binding,
+        [out] int* active,
+        [out, string, size_is(expiresAtChars)] wchar_t* expiresAtUtc,
+        [in] unsigned long expiresAtChars);
+
+    error_status_t RpcActivateProduct(
+        [in] handle_t binding,
+        [in, string] const wchar_t* activationCode,
+        [out] int* active,
+        [out, string, size_is(expiresAtChars)] wchar_t* expiresAtUtc,
+        [in] unsigned long expiresAtChars);
 }

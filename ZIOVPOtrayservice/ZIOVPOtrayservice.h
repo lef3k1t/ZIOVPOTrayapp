@@ -9,6 +9,8 @@
 #endif
 
 #include <windows.h>
+#include <wincrypt.h>
 #include <rpc.h>
 #include <userenv.h>
 #include <wtsapi32.h>
+#include <iphlpapi.h>
