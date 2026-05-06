@@ -1,0 +1,8 @@
+[
+    uuid(7f8a2e9f-9e41-470a-8dc8-6a10f9ad2f22),
+    version(1.0)
+]
+interface ZIOVPOTrayRpc
+{
+    void RpcStopService([in] handle_t binding);
+}

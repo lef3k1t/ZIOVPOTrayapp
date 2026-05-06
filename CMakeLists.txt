@@ -13,3 +13,4 @@ project ("ZIOVPOtrayapp")
 
 # Включите подпроекты.
 add_subdirectory ("ZIOVPOtrayapp")
+add_subdirectory ("ZIOVPOtrayservice")

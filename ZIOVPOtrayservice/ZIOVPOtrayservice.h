@@ -9,6 +9,6 @@
 #endif
 
 #include <windows.h>
-#include <shellapi.h>
-#include <tlhelp32.h>
 #include <rpc.h>
+#include <userenv.h>
+#include <wtsapi32.h>
