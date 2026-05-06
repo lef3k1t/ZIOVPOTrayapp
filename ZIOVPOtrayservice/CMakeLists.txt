@@ -23,7 +23,12 @@ if (CMAKE_VERSION VERSION_GREATER 3.12)
   set_property(TARGET ZIOVPOtrayservice PROPERTY CXX_STANDARD 20)
 endif()
 
-target_compile_definitions(ZIOVPOtrayservice PRIVATE UNICODE _UNICODE)
+target_compile_definitions(ZIOVPOtrayservice PRIVATE
+  UNICODE
+  _UNICODE
+  WINVER=0x0601
+  _WIN32_WINNT=0x0601
+)
 target_include_directories(ZIOVPOtrayservice PRIVATE "${RPC_OUTPUT_DIR}")
 
 if (MSVC)
@@ -37,6 +42,7 @@ target_link_libraries(ZIOVPOtrayservice PRIVATE
   rpcrt4
   userenv
   winhttp
+  ws2_32
   wtsapi32
 )
 

@@ -274,6 +274,7 @@ std::wstring GetDeviceMac()
         wchar_t mac[32]{};
         swprintf_s(
             mac,
+            ARRAYSIZE(mac),
             L"%02X-%02X-%02X-%02X-%02X-%02X",
             adapter->PhysicalAddress[0],
             adapter->PhysicalAddress[1],
