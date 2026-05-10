@@ -27,6 +27,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path installer-package | Out-Null
+          Copy-Item artifact/ZIOVPOtrayinstaller.exe installer-package/
           Copy-Item artifact/ZIOVPOtrayapp.exe installer-package/
           Copy-Item artifact/ZIOVPOtrayservice.exe installer-package/
           Copy-Item artifact/avdb-default.bin installer-package/
@@ -44,6 +45,9 @@ jobs:
           if (!(Test-Path "artifact/ZIOVPOtrayservice.exe")) {
             throw "artifact/ZIOVPOtrayservice.exe was not produced"
           }
+          if (!(Test-Path "artifact/ZIOVPOtrayinstaller.exe")) {
+            throw "artifact/ZIOVPOtrayinstaller.exe was not produced"
+          }
           if (!(Test-Path "artifact/avdb-default.bin")) {
             throw "artifact/avdb-default.bin was not produced"
           }
@@ -58,6 +62,7 @@ jobs:
           path: |
             artifact/ZIOVPOtrayapp.exe
             artifact/ZIOVPOtrayservice.exe
+            artifact/ZIOVPOtrayinstaller.exe
             artifact/avdb-default.bin
           if-no-files-found: error
 
@@ -65,5 +70,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ZIOVPOtrayapp-installer
-          path: artifact/ZIOVPOtrayapp-installer.zip
+          path: |
+            artifact/ZIOVPOtrayapp-installer.zip
+            artifact/ZIOVPOtrayinstaller.exe
           if-no-files-found: error
