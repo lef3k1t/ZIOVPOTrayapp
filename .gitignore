@@ -4,6 +4,7 @@ build/
 build-*/
 build-task*/
 artifact/
+installer-package/
 scan-test/
 
 *.user
