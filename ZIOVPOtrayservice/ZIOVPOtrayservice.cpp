@@ -57,6 +57,7 @@ struct AvDatabaseState
     bool loaded = false;
     std::wstring releaseDateUtc;
     std::map<ULONGLONG, std::vector<AvRecord>> records;
+    DWORD updateGeneration = 0;
 };
 
 AvDatabaseState g_avDatabase;
@@ -421,6 +422,333 @@ std::vector<BYTE> BytesFromAscii(const char* text)
     return std::vector<BYTE>(reinterpret_cast<const BYTE*>(text), reinterpret_cast<const BYTE*>(text) + length);
 }
 
+AvRecord MakeAvRecord(const char* signature, ULONGLONG offsetBegin, ULONGLONG offsetEnd, ObjectType objectType, const wchar_t* detectionName);
+
+std::vector<AvRecord> DefaultAvRecords()
+{
+    return {
+        MakeAvRecord("EICAR-PE-SAMPLE", 0, 1024 * 1024, ObjectType::PeFile, L"Test.PE.EicarLike"),
+        MakeAvRecord("EICAR-PS-SAMPLE", 0, 1024 * 1024, ObjectType::PowerShellScript, L"Test.PowerShell.EicarLike")
+    };
+}
+
+std::wstring CurrentUtcText()
+{
+    SYSTEMTIME time{};
+    GetSystemTime(&time);
+    wchar_t releaseDate[64]{};
+    swprintf_s(
+        releaseDate,
+        L"%04u-%02u-%02uT%02u:%02u:%02uZ",
+        time.wYear,
+        time.wMonth,
+        time.wDay,
+        time.wHour,
+        time.wMinute,
+        time.wSecond);
+    return releaseDate;
+}
+
+std::string NarrowAscii(const std::wstring& value)
+{
+    std::string result;
+    result.reserve(value.size());
+    for (wchar_t character : value)
+    {
+        result.push_back(character >= 0 && character <= 127 ? static_cast<char>(character) : '?');
+    }
+    return result;
+}
+
+std::wstring AvDatabasePath()
+{
+    return GetModuleDirectory() + L"\\avdb.bin";
+}
+
+std::wstring AvDatabaseBackupPath()
+{
+    return GetModuleDirectory() + L"\\avdb.bin.bak";
+}
+
+std::wstring AvDatabaseDefaultPath()
+{
+    return GetModuleDirectory() + L"\\avdb-default.bin";
+}
+
+void AppendBytes(std::vector<BYTE>& target, const void* data, size_t size)
+{
+    const auto bytes = static_cast<const BYTE*>(data);
+    target.insert(target.end(), bytes, bytes + size);
+}
+
+void AppendString(std::vector<BYTE>& target, const std::string& value)
+{
+    target.insert(target.end(), value.begin(), value.end());
+}
+
+std::vector<BYTE> RecordSignedBytes(const AvRecord& record)
+{
+    std::vector<BYTE> bytes;
+    AppendBytes(bytes, &record.objectSignaturePrefix, sizeof(record.objectSignaturePrefix));
+    AppendBytes(bytes, &record.objectSignatureLength, sizeof(record.objectSignatureLength));
+    AppendBytes(bytes, record.objectSignature.data(), record.objectSignature.size());
+    AppendBytes(bytes, &record.offsetBegin, sizeof(record.offsetBegin));
+    AppendBytes(bytes, &record.offsetEnd, sizeof(record.offsetEnd));
+    const DWORD type = static_cast<DWORD>(record.objectType);
+    AppendBytes(bytes, &type, sizeof(type));
+    const std::string detectionName = Narrow(record.detectionName);
+    const DWORD detectionNameLength = static_cast<DWORD>(detectionName.size());
+    AppendBytes(bytes, &detectionNameLength, sizeof(detectionNameLength));
+    AppendString(bytes, detectionName);
+    return bytes;
+}
+
+std::vector<BYTE> ManifestSignedBytes(const std::string& releaseDate, DWORD recordCount, DWORD generation)
+{
+    std::vector<BYTE> bytes;
+    const DWORD releaseDateLength = static_cast<DWORD>(releaseDate.size());
+    AppendBytes(bytes, &releaseDateLength, sizeof(releaseDateLength));
+    AppendString(bytes, releaseDate);
+    AppendBytes(bytes, &recordCount, sizeof(recordCount));
+    AppendBytes(bytes, &generation, sizeof(generation));
+    return bytes;
+}
+
+bool WriteAllBytes(const std::wstring& path, const std::vector<BYTE>& bytes)
+{
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+
+    DWORD written = 0;
+    const BOOL ok = WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr);
+    CloseHandle(file);
+    return ok && written == bytes.size();
+}
+
+bool ReadAllBytes(const std::wstring& path, std::vector<BYTE>& bytes)
+{
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size) || size.QuadPart < 0 || size.QuadPart > 64LL * 1024 * 1024)
+    {
+        CloseHandle(file);
+        return false;
+    }
+
+    bytes.resize(static_cast<size_t>(size.QuadPart));
+    DWORD read = 0;
+    const BOOL ok = ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr);
+    CloseHandle(file);
+    return ok && read == bytes.size();
+}
+
+bool ReadBlob(const std::vector<BYTE>& bytes, size_t& offset, void* target, size_t size)
+{
+    if (offset + size > bytes.size())
+    {
+        return false;
+    }
+
+    memcpy(target, bytes.data() + offset, size);
+    offset += size;
+    return true;
+}
+
+bool ReadStringBlob(const std::vector<BYTE>& bytes, size_t& offset, std::string& value)
+{
+    DWORD length = 0;
+    if (!ReadBlob(bytes, offset, &length, sizeof(length)) || offset + length > bytes.size())
+    {
+        return false;
+    }
+
+    value.assign(reinterpret_cast<const char*>(bytes.data() + offset), length);
+    offset += length;
+    return true;
+}
+
+std::vector<BYTE> SerializeAvDatabase(const std::vector<AvRecord>& records, const std::wstring& releaseDateUtc, DWORD generation)
+{
+    constexpr char magic[8] = {'Z', 'A', 'V', 'D', 'B', '0', '0', '1'};
+    std::vector<BYTE> bytes;
+    AppendBytes(bytes, magic, sizeof(magic));
+
+    const std::string releaseDate = NarrowAscii(releaseDateUtc);
+    const DWORD recordCount = static_cast<DWORD>(records.size());
+    const auto manifestBytes = ManifestSignedBytes(releaseDate, recordCount, generation);
+    const auto manifestSignature = Sha256(manifestBytes);
+
+    const DWORD releaseDateLength = static_cast<DWORD>(releaseDate.size());
+    AppendBytes(bytes, &releaseDateLength, sizeof(releaseDateLength));
+    AppendString(bytes, releaseDate);
+    AppendBytes(bytes, &recordCount, sizeof(recordCount));
+    AppendBytes(bytes, &generation, sizeof(generation));
+    AppendBytes(bytes, manifestSignature.data(), manifestSignature.size());
+
+    for (AvRecord record : records)
+    {
+        record.avRecordSignature = Sha256(RecordSignedBytes(record));
+        AppendBytes(bytes, &record.objectSignaturePrefix, sizeof(record.objectSignaturePrefix));
+        AppendBytes(bytes, &record.objectSignatureLength, sizeof(record.objectSignatureLength));
+        AppendBytes(bytes, record.objectSignature.data(), record.objectSignature.size());
+        AppendBytes(bytes, &record.offsetBegin, sizeof(record.offsetBegin));
+        AppendBytes(bytes, &record.offsetEnd, sizeof(record.offsetEnd));
+        const DWORD type = static_cast<DWORD>(record.objectType);
+        AppendBytes(bytes, &type, sizeof(type));
+        const std::string detectionName = Narrow(record.detectionName);
+        const DWORD detectionNameLength = static_cast<DWORD>(detectionName.size());
+        AppendBytes(bytes, &detectionNameLength, sizeof(detectionNameLength));
+        AppendString(bytes, detectionName);
+        AppendBytes(bytes, record.avRecordSignature.data(), record.avRecordSignature.size());
+    }
+
+    return bytes;
+}
+
+bool SaveAvDatabaseFile(const std::wstring& path, const std::vector<AvRecord>& records, const std::wstring& releaseDateUtc, DWORD generation)
+{
+    return WriteAllBytes(path, SerializeAvDatabase(records, releaseDateUtc, generation));
+}
+
+bool ParseAvDatabaseFile(const std::wstring& path, AvDatabaseState& database)
+{
+    constexpr char magic[8] = {'Z', 'A', 'V', 'D', 'B', '0', '0', '1'};
+    std::vector<BYTE> bytes;
+    if (!ReadAllBytes(path, bytes))
+    {
+        WriteDebugLog(L"AV DB read failed: " + path);
+        return false;
+    }
+
+    size_t offset = 0;
+    char readMagic[8]{};
+    if (!ReadBlob(bytes, offset, readMagic, sizeof(readMagic)) || memcmp(readMagic, magic, sizeof(magic)) != 0)
+    {
+        WriteDebugLog(L"AV DB magic mismatch: " + path);
+        return false;
+    }
+
+    std::string releaseDate;
+    DWORD recordCount = 0;
+    DWORD generation = 0;
+    std::array<BYTE, 32> manifestSignature{};
+    if (!ReadStringBlob(bytes, offset, releaseDate) ||
+        !ReadBlob(bytes, offset, &recordCount, sizeof(recordCount)) ||
+        !ReadBlob(bytes, offset, &generation, sizeof(generation)) ||
+        !ReadBlob(bytes, offset, manifestSignature.data(), manifestSignature.size()))
+    {
+        WriteDebugLog(L"AV DB manifest read failed: " + path);
+        return false;
+    }
+
+    if (Sha256(ManifestSignedBytes(releaseDate, recordCount, generation)) != manifestSignature)
+    {
+        WriteDebugLog(L"AV DB manifest signature failed: " + path);
+        return false;
+    }
+
+    database = AvDatabaseState{};
+    database.releaseDateUtc = Widen(releaseDate);
+    database.updateGeneration = generation;
+
+    for (DWORD index = 0; index < recordCount; ++index)
+    {
+        AvRecord record{};
+        DWORD type = 0;
+        std::string detectionName;
+        if (!ReadBlob(bytes, offset, &record.objectSignaturePrefix, sizeof(record.objectSignaturePrefix)) ||
+            !ReadBlob(bytes, offset, &record.objectSignatureLength, sizeof(record.objectSignatureLength)) ||
+            !ReadBlob(bytes, offset, record.objectSignature.data(), record.objectSignature.size()) ||
+            !ReadBlob(bytes, offset, &record.offsetBegin, sizeof(record.offsetBegin)) ||
+            !ReadBlob(bytes, offset, &record.offsetEnd, sizeof(record.offsetEnd)) ||
+            !ReadBlob(bytes, offset, &type, sizeof(type)) ||
+            !ReadStringBlob(bytes, offset, detectionName) ||
+            !ReadBlob(bytes, offset, record.avRecordSignature.data(), record.avRecordSignature.size()))
+        {
+            WriteDebugLog(L"AV DB record read failed, index=" + std::to_wstring(index));
+            break;
+        }
+
+        record.objectType = static_cast<ObjectType>(type);
+        record.detectionName = Widen(detectionName);
+        if (Sha256(RecordSignedBytes(record)) != record.avRecordSignature)
+        {
+            WriteDebugLog(L"AV DB record signature failed, index=" + std::to_wstring(index));
+            continue;
+        }
+
+        database.records[record.objectSignaturePrefix].push_back(record);
+    }
+
+    database.loaded = true;
+    WriteDebugLog(L"AV DB loaded from " + path + L", records=" + std::to_wstring(database.records.size()));
+    return true;
+}
+
+bool CopyFileReplacing(const std::wstring& from, const std::wstring& to)
+{
+    return CopyFileW(from.c_str(), to.c_str(), FALSE) != FALSE;
+}
+
+void EnsureDefaultAvDatabaseFile()
+{
+    const std::wstring defaultPath = AvDatabaseDefaultPath();
+    if (GetFileAttributesW(defaultPath.c_str()) != INVALID_FILE_ATTRIBUTES)
+    {
+        return;
+    }
+
+    SaveAvDatabaseFile(defaultPath, DefaultAvRecords(), L"2026-05-11T00:00:00Z", 1);
+    WriteDebugLog(L"Default AV DB generated: " + defaultPath);
+}
+
+bool LoadAvDatabaseFromDisk()
+{
+    EnsureDefaultAvDatabaseFile();
+
+    AvDatabaseState loaded{};
+    if (ParseAvDatabaseFile(AvDatabasePath(), loaded))
+    {
+        g_avDatabase = loaded;
+        return true;
+    }
+
+    WriteDebugLog(L"Trying AV DB restore from backup");
+    if (ParseAvDatabaseFile(AvDatabaseBackupPath(), loaded))
+    {
+        CopyFileReplacing(AvDatabaseBackupPath(), AvDatabasePath());
+        g_avDatabase = loaded;
+        return true;
+    }
+
+    WriteDebugLog(L"Trying default AV DB");
+    if (ParseAvDatabaseFile(AvDatabaseDefaultPath(), loaded))
+    {
+        CopyFileReplacing(AvDatabaseDefaultPath(), AvDatabasePath());
+        g_avDatabase = loaded;
+        return true;
+    }
+
+    WriteDebugLog(L"Default AV DB parse failed, using generated in-memory records");
+    g_avDatabase = AvDatabaseState{};
+    g_avDatabase.releaseDateUtc = CurrentUtcText();
+    g_avDatabase.updateGeneration = 1;
+    for (const AvRecord& record : DefaultAvRecords())
+    {
+        g_avDatabase.records[record.objectSignaturePrefix].push_back(record);
+    }
+    g_avDatabase.loaded = true;
+    return false;
+}
+
 AvRecord MakeAvRecord(const char* signature, ULONGLONG offsetBegin, ULONGLONG offsetEnd, ObjectType objectType, const wchar_t* detectionName)
 {
     std::vector<BYTE> bytes = BytesFromAscii(signature);
@@ -453,25 +781,8 @@ void AddAvRecordLocked(const AvRecord& record)
 void LoadAvDatabases()
 {
     EnterCriticalSection(&g_avLock);
-    g_avDatabase.records.clear();
-    AddAvRecordLocked(MakeAvRecord("EICAR-PE-SAMPLE", 0, 1024 * 1024, ObjectType::PeFile, L"Test.PE.EicarLike"));
-    AddAvRecordLocked(MakeAvRecord("EICAR-PS-SAMPLE", 0, 1024 * 1024, ObjectType::PowerShellScript, L"Test.PowerShell.EicarLike"));
-
-    SYSTEMTIME time{};
-    GetSystemTime(&time);
-    wchar_t releaseDate[64]{};
-    swprintf_s(
-        releaseDate,
-        L"%04u-%02u-%02uT%02u:%02u:%02uZ",
-        time.wYear,
-        time.wMonth,
-        time.wDay,
-        time.wHour,
-        time.wMinute,
-        time.wSecond);
-    g_avDatabase.releaseDateUtc = releaseDate;
-    g_avDatabase.loaded = true;
-    WriteDebugLog(L"AV databases loaded, records=" + std::to_wstring(g_avDatabase.records.size()));
+    LoadAvDatabaseFromDisk();
+    WriteDebugLog(L"AV databases active records=" + std::to_wstring(AvRecordCountLocked()));
     LeaveCriticalSection(&g_avLock);
 }
 
@@ -1062,6 +1373,49 @@ DWORD WINAPI AccountRefreshThread(void*)
     return 0;
 }
 
+DWORD WINAPI AvDatabaseUpdateThread(void*)
+{
+    while (WaitForSingleObject(g_stopEvent, 60 * 60 * 1000) == WAIT_TIMEOUT)
+    {
+        WriteDebugLog(L"Scheduled AV DB update started");
+        EnterCriticalSection(&g_avLock);
+        const std::wstring databasePath = AvDatabasePath();
+        const std::wstring backupPath = AvDatabaseBackupPath();
+        if (GetFileAttributesW(databasePath.c_str()) != INVALID_FILE_ATTRIBUTES)
+        {
+            CopyFileReplacing(databasePath, backupPath);
+        }
+
+        std::vector<AvRecord> updatedRecords = DefaultAvRecords();
+        updatedRecords.push_back(MakeAvRecord("EICAR-PE-UPD-002", 0, 1024 * 1024, ObjectType::PeFile, L"Test.PE.Updated"));
+        const DWORD nextGeneration = g_avDatabase.updateGeneration + 1;
+        const bool saved = SaveAvDatabaseFile(databasePath, updatedRecords, CurrentUtcText(), nextGeneration);
+
+        AvDatabaseState loaded{};
+        if (saved && ParseAvDatabaseFile(databasePath, loaded))
+        {
+            g_avDatabase = loaded;
+            WriteDebugLog(L"Scheduled AV DB update applied, generation=" + std::to_wstring(nextGeneration));
+        }
+        else
+        {
+            WriteDebugLog(L"Scheduled AV DB update failed, rolling back");
+            if (GetFileAttributesW(backupPath.c_str()) != INVALID_FILE_ATTRIBUTES)
+            {
+                CopyFileReplacing(backupPath, databasePath);
+                ParseAvDatabaseFile(databasePath, g_avDatabase);
+            }
+            else
+            {
+                LoadAvDatabaseFromDisk();
+            }
+        }
+        LeaveCriticalSection(&g_avLock);
+    }
+
+    return 0;
+}
+
 DWORD WINAPI RpcServerThread(void*)
 {
     WriteDebugLog(L"RPC server thread starting");
@@ -1161,6 +1515,7 @@ void WINAPI ServiceMain(DWORD, LPWSTR*)
 
     HANDLE monitorThread = CreateThread(nullptr, 0, SessionMonitorThread, nullptr, 0, nullptr);
     HANDLE accountThread = CreateThread(nullptr, 0, AccountRefreshThread, nullptr, 0, nullptr);
+    HANDLE avUpdateThread = CreateThread(nullptr, 0, AvDatabaseUpdateThread, nullptr, 0, nullptr);
 
     StartTrayForActiveSessions();
 
@@ -1184,6 +1539,12 @@ void WINAPI ServiceMain(DWORD, LPWSTR*)
     {
         WaitForSingleObject(accountThread, 5000);
         CloseHandle(accountThread);
+    }
+
+    if (avUpdateThread)
+    {
+        WaitForSingleObject(avUpdateThread, 5000);
+        CloseHandle(avUpdateThread);
     }
 
     StopAllTrayProcesses();

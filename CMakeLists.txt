@@ -15,6 +15,8 @@ endif()
 
 project ("ZIOVPOtrayapp")
 
+set(ZIOVPO_DEFAULT_AVDB "${CMAKE_SOURCE_DIR}/assets/avdb-default.bin")
+
 # Включите подпроекты.
 add_subdirectory ("ZIOVPOtrayapp")
 add_subdirectory ("ZIOVPOtrayservice")

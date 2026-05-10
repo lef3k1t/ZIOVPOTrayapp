@@ -49,3 +49,7 @@ target_link_libraries(ZIOVPOtrayservice PRIVATE
 )
 
 install(TARGETS ZIOVPOtrayservice RUNTIME DESTINATION .)
+
+if (EXISTS "${ZIOVPO_DEFAULT_AVDB}")
+  install(FILES "${ZIOVPO_DEFAULT_AVDB}" DESTINATION .)
+endif()

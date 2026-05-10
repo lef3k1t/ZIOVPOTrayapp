@@ -2,7 +2,9 @@
 out/
 build/
 build-*/
+build-task*/
 artifact/
+scan-test/
 
 *.user
 *.suo
