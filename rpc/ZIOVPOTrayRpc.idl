@@ -31,4 +31,25 @@ interface ZIOVPOTrayRpc
         [out] int* active,
         [out, string, size_is(expiresAtChars)] wchar_t* expiresAtUtc,
         [in] unsigned long expiresAtChars);
+
+    error_status_t RpcGetAvDatabaseInfo(
+        [in] handle_t binding,
+        [out] unsigned long* recordCount,
+        [out, string, size_is(releaseDateChars)] wchar_t* releaseDateUtc,
+        [in] unsigned long releaseDateChars);
+
+    error_status_t RpcScanFile(
+        [in] handle_t binding,
+        [in, string] const wchar_t* path,
+        [out] int* infected,
+        [out, string, size_is(resultChars)] wchar_t* result,
+        [in] unsigned long resultChars);
+
+    error_status_t RpcScanDirectory(
+        [in] handle_t binding,
+        [in, string] const wchar_t* path,
+        [out] unsigned long* scannedFiles,
+        [out] unsigned long* infectedFiles,
+        [out, string, size_is(resultChars)] wchar_t* result,
+        [in] unsigned long resultChars);
 }

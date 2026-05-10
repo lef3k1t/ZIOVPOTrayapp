@@ -16,6 +16,8 @@ constexpr UINT ID_FILE_EXIT = 2001;
 constexpr UINT ID_LOGIN_BUTTON = 3001;
 constexpr UINT ID_ACTIVATE_BUTTON = 3002;
 constexpr UINT ID_LOGOUT_BUTTON = 3003;
+constexpr UINT ID_SCAN_FILE_BUTTON = 3004;
+constexpr UINT ID_SCAN_DIRECTORY_BUTTON = 3005;
 constexpr UINT ID_LICENSE_TIMER = 4001;
 constexpr UINT ID_TRAY_RETRY_TIMER = 4002;
 constexpr UINT TRAY_ICON_ID = 1;
@@ -42,6 +44,11 @@ HWND g_loginButton = nullptr;
 HWND g_activationEdit = nullptr;
 HWND g_activateButton = nullptr;
 HWND g_logoutButton = nullptr;
+HWND g_avDbLabel = nullptr;
+HWND g_scanPathEdit = nullptr;
+HWND g_scanFileButton = nullptr;
+HWND g_scanDirectoryButton = nullptr;
+HWND g_scanResultLabel = nullptr;
 std::wstring g_currentUser;
 
 std::wstring GetModuleDirectory()
@@ -564,6 +571,89 @@ DWORD RpcActivateLicense(const std::wstring& code, bool& active, std::wstring& e
     return status;
 }
 
+bool QueryAvDatabaseInfo(DWORD& recordCount, std::wstring& releaseDate)
+{
+    handle_t binding = nullptr;
+    if (!CreateRpcBinding(&binding))
+    {
+        return false;
+    }
+
+    unsigned long rpcRecordCount = 0;
+    wchar_t rpcReleaseDate[128]{};
+    RPC_STATUS status = RPC_S_OK;
+    RpcTryExcept
+    {
+        status = RpcGetAvDatabaseInfo(binding, &rpcRecordCount, rpcReleaseDate, ARRAYSIZE(rpcReleaseDate));
+    }
+    RpcExcept(1)
+    {
+        status = RpcExceptionCode();
+    }
+    RpcEndExcept
+
+    FreeRpcBinding(binding);
+    recordCount = rpcRecordCount;
+    releaseDate = rpcReleaseDate;
+    return status == RPC_S_OK;
+}
+
+DWORD RpcScanSelectedFile(const std::wstring& path, bool& infected, std::wstring& result)
+{
+    handle_t binding = nullptr;
+    if (!CreateRpcBinding(&binding))
+    {
+        return RPC_S_SERVER_UNAVAILABLE;
+    }
+
+    int rpcInfected = 0;
+    wchar_t rpcResult[1024]{};
+    RPC_STATUS status = RPC_S_OK;
+    RpcTryExcept
+    {
+        status = RpcScanFile(binding, path.c_str(), &rpcInfected, rpcResult, ARRAYSIZE(rpcResult));
+    }
+    RpcExcept(1)
+    {
+        status = RpcExceptionCode();
+    }
+    RpcEndExcept
+
+    FreeRpcBinding(binding);
+    infected = rpcInfected != 0;
+    result = rpcResult;
+    return status;
+}
+
+DWORD RpcScanSelectedDirectory(const std::wstring& path, DWORD& scannedFiles, DWORD& infectedFiles, std::wstring& result)
+{
+    handle_t binding = nullptr;
+    if (!CreateRpcBinding(&binding))
+    {
+        return RPC_S_SERVER_UNAVAILABLE;
+    }
+
+    unsigned long rpcScanned = 0;
+    unsigned long rpcInfected = 0;
+    wchar_t rpcResult[1024]{};
+    RPC_STATUS status = RPC_S_OK;
+    RpcTryExcept
+    {
+        status = RpcScanDirectory(binding, path.c_str(), &rpcScanned, &rpcInfected, rpcResult, ARRAYSIZE(rpcResult));
+    }
+    RpcExcept(1)
+    {
+        status = RpcExceptionCode();
+    }
+    RpcEndExcept
+
+    FreeRpcBinding(binding);
+    scannedFiles = rpcScanned;
+    infectedFiles = rpcInfected;
+    result = rpcResult;
+    return status;
+}
+
 void RefreshAccountUi()
 {
     WriteDebugLog(L"RefreshAccountUi begin");
@@ -589,11 +679,18 @@ void RefreshAccountUi()
     {
         WriteDebugLog(L"RefreshAccountUi: license active");
         SetActivationControlsVisible(false);
+        DWORD recordCount = 0;
+        std::wstring releaseDate;
+        if (QueryAvDatabaseInfo(recordCount, releaseDate))
+        {
+            SetWindowTextSafe(g_avDbLabel, L"Антивирусные базы: " + releaseDate + L", записей: " + std::to_wstring(recordCount));
+        }
         SetWindowTextSafe(g_statusLabel, L"Пользователь: " + g_currentUser + L"\r\nЛицензия активна до: " + expiresAt + L"\r\nФункции антивируса разблокированы.");
         return;
     }
 
     SetActivationControlsVisible(true);
+    SetWindowTextSafe(g_avDbLabel, L"Антивирусные базы недоступны без лицензии.");
     WriteDebugLog(L"RefreshAccountUi: no active license");
     SetWindowTextSafe(g_statusLabel, L"Пользователь: " + g_currentUser + L"\r\nЛицензия отсутствует. Функции антивируса заблокированы.");
 }
@@ -611,6 +708,13 @@ void CreateAccountControls()
     g_activationEdit = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 152, 222, 220, 26, g_mainWindow, nullptr, g_instance, nullptr);
     g_activateButton = CreateWindowW(L"BUTTON", L"Активировать", WS_CHILD | WS_VISIBLE, 392, 220, 140, 30, g_mainWindow, reinterpret_cast<HMENU>(ID_ACTIVATE_BUTTON), g_instance, nullptr);
     g_logoutButton = CreateWindowW(L"BUTTON", L"Выйти из аккаунта", WS_CHILD | WS_VISIBLE, 24, 300, 180, 30, g_mainWindow, reinterpret_cast<HMENU>(ID_LOGOUT_BUTTON), g_instance, nullptr);
+
+    g_avDbLabel = CreateWindowW(L"STATIC", L"Антивирусные базы: нет данных", WS_CHILD | WS_VISIBLE | SS_LEFT, 24, 350, 560, 24, g_mainWindow, nullptr, g_instance, nullptr);
+    CreateWindowW(L"STATIC", L"Путь:", WS_CHILD | WS_VISIBLE, 24, 388, 80, 22, g_mainWindow, nullptr, g_instance, nullptr);
+    g_scanPathEdit = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 112, 384, 420, 26, g_mainWindow, nullptr, g_instance, nullptr);
+    g_scanFileButton = CreateWindowW(L"BUTTON", L"Сканировать файл", WS_CHILD | WS_VISIBLE, 112, 424, 160, 30, g_mainWindow, reinterpret_cast<HMENU>(ID_SCAN_FILE_BUTTON), g_instance, nullptr);
+    g_scanDirectoryButton = CreateWindowW(L"BUTTON", L"Сканировать папку", WS_CHILD | WS_VISIBLE, 292, 424, 170, 30, g_mainWindow, reinterpret_cast<HMENU>(ID_SCAN_DIRECTORY_BUTTON), g_instance, nullptr);
+    g_scanResultLabel = CreateWindowW(L"STATIC", L"Результат сканирования появится здесь.", WS_CHILD | WS_VISIBLE | SS_LEFT, 24, 472, 580, 72, g_mainWindow, nullptr, g_instance, nullptr);
 }
 
 void ExitApplication()
@@ -731,6 +835,31 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
             RpcLogoutUser();
             RefreshAccountUi();
             return 0;
+        case ID_SCAN_FILE_BUTTON:
+        {
+            bool infected = false;
+            std::wstring result;
+            const DWORD status = RpcScanSelectedFile(GetControlText(g_scanPathEdit), infected, result);
+            if (status != RPC_S_OK)
+            {
+                result = L"Сканирование файла не выполнено. Проверьте лицензию и путь.";
+            }
+            SetWindowTextSafe(g_scanResultLabel, result);
+            return 0;
+        }
+        case ID_SCAN_DIRECTORY_BUTTON:
+        {
+            DWORD scannedFiles = 0;
+            DWORD infectedFiles = 0;
+            std::wstring result;
+            const DWORD status = RpcScanSelectedDirectory(GetControlText(g_scanPathEdit), scannedFiles, infectedFiles, result);
+            if (status != RPC_S_OK)
+            {
+                result = L"Сканирование папки не выполнено. Проверьте лицензию и путь.";
+            }
+            SetWindowTextSafe(g_scanResultLabel, result);
+            return 0;
+        }
         default:
             return 0;
         }
@@ -800,7 +929,7 @@ bool CreateMainWindow()
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         640,
-        420,
+        600,
         nullptr,
         g_mainMenu,
         g_instance,

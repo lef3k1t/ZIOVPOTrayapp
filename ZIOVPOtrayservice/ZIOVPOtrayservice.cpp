@@ -2,9 +2,14 @@
 #include "ZIOVPOTrayRpc.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
+#include <cwctype>
+#include <cstring>
+#include <fstream>
+#include <map>
 #include <string>
 #include <vector>
 #include <winhttp.h>
@@ -25,7 +30,36 @@ HANDLE g_refreshEvent = nullptr;
 HANDLE g_rpcReadyEvent = nullptr;
 CRITICAL_SECTION g_processLock{};
 CRITICAL_SECTION g_accountLock{};
+CRITICAL_SECTION g_avLock{};
 std::vector<PROCESS_INFORMATION> g_trayProcesses;
+
+enum class ObjectType : DWORD
+{
+    Unknown = 0,
+    PeFile = 1,
+    PowerShellScript = 2
+};
+
+struct AvRecord
+{
+    ULONGLONG objectSignaturePrefix = 0;
+    DWORD objectSignatureLength = 0;
+    std::array<BYTE, 32> objectSignature{};
+    ULONGLONG offsetBegin = 0;
+    ULONGLONG offsetEnd = 0;
+    ObjectType objectType = ObjectType::Unknown;
+    std::array<BYTE, 32> avRecordSignature{};
+    std::wstring detectionName;
+};
+
+struct AvDatabaseState
+{
+    bool loaded = false;
+    std::wstring releaseDateUtc;
+    std::map<ULONGLONG, std::vector<AvRecord>> records;
+};
+
+AvDatabaseState g_avDatabase;
 
 struct AccountState
 {
@@ -139,6 +173,14 @@ std::wstring Widen(const std::string& value)
         MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, result.data(), size);
     }
     return result;
+}
+
+std::wstring ToLower(std::wstring value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t character) {
+        return static_cast<wchar_t>(towlower(character));
+    });
+    return value;
 }
 
 std::string JsonEscape(const std::wstring& value)
@@ -338,6 +380,268 @@ std::string LicenseActivationBody(const wchar_t* activationCode)
     return "{\"activationKey\":\"" + JsonEscape(activationCode ? activationCode : L"") +
         "\",\"deviceMac\":\"" + JsonEscape(GetDeviceMac()) +
         "\",\"deviceName\":\"" + JsonEscape(GetDeviceName()) + "\"}";
+}
+
+std::array<BYTE, 32> Sha256(const std::vector<BYTE>& bytes)
+{
+    std::array<BYTE, 32> result{};
+    HCRYPTPROV provider = 0;
+    HCRYPTHASH hash = 0;
+
+    if (CryptAcquireContextW(&provider, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT) &&
+        CryptCreateHash(provider, CALG_SHA_256, 0, 0, &hash) &&
+        CryptHashData(hash, bytes.data(), static_cast<DWORD>(bytes.size()), 0))
+    {
+        DWORD hashSize = static_cast<DWORD>(result.size());
+        CryptGetHashParam(hash, HP_HASHVAL, result.data(), &hashSize, 0);
+    }
+
+    if (hash)
+    {
+        CryptDestroyHash(hash);
+    }
+    if (provider)
+    {
+        CryptReleaseContext(provider, 0);
+    }
+
+    return result;
+}
+
+ULONGLONG PrefixFromBytes(const BYTE* bytes)
+{
+    ULONGLONG prefix = 0;
+    memcpy(&prefix, bytes, sizeof(prefix));
+    return prefix;
+}
+
+std::vector<BYTE> BytesFromAscii(const char* text)
+{
+    const size_t length = strlen(text);
+    return std::vector<BYTE>(reinterpret_cast<const BYTE*>(text), reinterpret_cast<const BYTE*>(text) + length);
+}
+
+AvRecord MakeAvRecord(const char* signature, ULONGLONG offsetBegin, ULONGLONG offsetEnd, ObjectType objectType, const wchar_t* detectionName)
+{
+    std::vector<BYTE> bytes = BytesFromAscii(signature);
+    AvRecord record{};
+    record.objectSignaturePrefix = PrefixFromBytes(bytes.data());
+    record.objectSignatureLength = static_cast<DWORD>(bytes.size());
+    record.objectSignature = Sha256(bytes);
+    record.offsetBegin = offsetBegin;
+    record.offsetEnd = offsetEnd;
+    record.objectType = objectType;
+    record.detectionName = detectionName;
+
+    std::vector<BYTE> recordBytes;
+    recordBytes.insert(recordBytes.end(), reinterpret_cast<BYTE*>(&record.objectSignaturePrefix), reinterpret_cast<BYTE*>(&record.objectSignaturePrefix) + sizeof(record.objectSignaturePrefix));
+    recordBytes.insert(recordBytes.end(), reinterpret_cast<BYTE*>(&record.objectSignatureLength), reinterpret_cast<BYTE*>(&record.objectSignatureLength) + sizeof(record.objectSignatureLength));
+    recordBytes.insert(recordBytes.end(), record.objectSignature.begin(), record.objectSignature.end());
+    recordBytes.insert(recordBytes.end(), reinterpret_cast<BYTE*>(&record.offsetBegin), reinterpret_cast<BYTE*>(&record.offsetBegin) + sizeof(record.offsetBegin));
+    recordBytes.insert(recordBytes.end(), reinterpret_cast<BYTE*>(&record.offsetEnd), reinterpret_cast<BYTE*>(&record.offsetEnd) + sizeof(record.offsetEnd));
+    const DWORD type = static_cast<DWORD>(record.objectType);
+    recordBytes.insert(recordBytes.end(), reinterpret_cast<const BYTE*>(&type), reinterpret_cast<const BYTE*>(&type) + sizeof(type));
+    record.avRecordSignature = Sha256(recordBytes);
+    return record;
+}
+
+void AddAvRecordLocked(const AvRecord& record)
+{
+    g_avDatabase.records[record.objectSignaturePrefix].push_back(record);
+}
+
+void LoadAvDatabases()
+{
+    EnterCriticalSection(&g_avLock);
+    g_avDatabase.records.clear();
+    AddAvRecordLocked(MakeAvRecord("EICAR-PE-SAMPLE", 0, 1024 * 1024, ObjectType::PeFile, L"Test.PE.EicarLike"));
+    AddAvRecordLocked(MakeAvRecord("EICAR-PS-SAMPLE", 0, 1024 * 1024, ObjectType::PowerShellScript, L"Test.PowerShell.EicarLike"));
+
+    SYSTEMTIME time{};
+    GetSystemTime(&time);
+    wchar_t releaseDate[64]{};
+    swprintf_s(
+        releaseDate,
+        L"%04u-%02u-%02uT%02u:%02u:%02uZ",
+        time.wYear,
+        time.wMonth,
+        time.wDay,
+        time.wHour,
+        time.wMinute,
+        time.wSecond);
+    g_avDatabase.releaseDateUtc = releaseDate;
+    g_avDatabase.loaded = true;
+    WriteDebugLog(L"AV databases loaded, records=" + std::to_wstring(g_avDatabase.records.size()));
+    LeaveCriticalSection(&g_avLock);
+}
+
+size_t AvRecordCountLocked()
+{
+    size_t count = 0;
+    for (const auto& item : g_avDatabase.records)
+    {
+        count += item.second.size();
+    }
+    return count;
+}
+
+std::wstring ExtensionFromPath(const std::wstring& path)
+{
+    const size_t dot = path.find_last_of(L'.');
+    return dot == std::wstring::npos ? L"" : ToLower(path.substr(dot));
+}
+
+ObjectType DetectObjectType(const std::wstring& path, const std::vector<BYTE>& bytes)
+{
+    if (bytes.size() >= 2 && bytes[0] == 'M' && bytes[1] == 'Z')
+    {
+        return ObjectType::PeFile;
+    }
+
+    const std::wstring extension = ExtensionFromPath(path);
+    if (extension == L".ps1" || extension == L".psm1" || extension == L".psd1")
+    {
+        return ObjectType::PowerShellScript;
+    }
+
+    return ObjectType::Unknown;
+}
+
+bool ReadFileBytes(const std::wstring& path, std::vector<BYTE>& bytes)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+    {
+        return false;
+    }
+
+    file.seekg(0, std::ios::end);
+    const std::streamoff size = file.tellg();
+    if (size <= 0)
+    {
+        bytes.clear();
+        return true;
+    }
+
+    file.seekg(0, std::ios::beg);
+    bytes.resize(static_cast<size_t>(size));
+    file.read(reinterpret_cast<char*>(bytes.data()), size);
+    return file.good() || file.eof();
+}
+
+bool ScanByteStream(const std::vector<BYTE>& bytes, ObjectType objectType, std::wstring& detectionName)
+{
+    if (bytes.size() < 8)
+    {
+        return false;
+    }
+
+    EnterCriticalSection(&g_avLock);
+    for (size_t position = 0; position + 8 <= bytes.size(); ++position)
+    {
+        const ULONGLONG prefix = PrefixFromBytes(bytes.data() + position);
+        const auto found = g_avDatabase.records.find(prefix);
+        if (found == g_avDatabase.records.end())
+        {
+            continue;
+        }
+
+        for (const AvRecord& record : found->second)
+        {
+            if (record.objectType != objectType)
+            {
+                continue;
+            }
+
+            if (position < record.offsetBegin || position > record.offsetEnd)
+            {
+                continue;
+            }
+
+            if (record.objectSignatureLength < 8 || position + record.objectSignatureLength > bytes.size())
+            {
+                continue;
+            }
+
+            std::vector<BYTE> candidate(bytes.begin() + position, bytes.begin() + position + record.objectSignatureLength);
+            if (Sha256(candidate) == record.objectSignature)
+            {
+                detectionName = record.detectionName;
+                LeaveCriticalSection(&g_avLock);
+                return true;
+            }
+        }
+    }
+
+    LeaveCriticalSection(&g_avLock);
+    return false;
+}
+
+bool ScanSingleFile(const std::wstring& path, std::wstring& result)
+{
+    std::vector<BYTE> bytes;
+    if (!ReadFileBytes(path, bytes))
+    {
+        result = L"Ошибка чтения файла: " + path;
+        return false;
+    }
+
+    const ObjectType objectType = DetectObjectType(path, bytes);
+    std::wstring detectionName;
+    if (ScanByteStream(bytes, objectType, detectionName))
+    {
+        result = L"Обнаружено: " + detectionName + L" в " + path;
+        return true;
+    }
+
+    result = L"Угроз не обнаружено: " + path;
+    return false;
+}
+
+void ScanDirectoryRecursive(const std::wstring& directory, DWORD& scannedFiles, DWORD& infectedFiles, std::wstring& firstDetection)
+{
+    std::wstring search = directory;
+    if (!search.empty() && search.back() != L'\\' && search.back() != L'/')
+    {
+        search += L"\\";
+    }
+
+    WIN32_FIND_DATAW findData{};
+    HANDLE find = FindFirstFileW((search + L"*").c_str(), &findData);
+    if (find == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+
+    do
+    {
+        const std::wstring name = findData.cFileName;
+        if (name == L"." || name == L"..")
+        {
+            continue;
+        }
+
+        const std::wstring fullPath = search + name;
+        if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        {
+            ScanDirectoryRecursive(fullPath, scannedFiles, infectedFiles, firstDetection);
+        }
+        else
+        {
+            ++scannedFiles;
+            std::wstring fileResult;
+            if (ScanSingleFile(fullPath, fileResult))
+            {
+                ++infectedFiles;
+                if (firstDetection.empty())
+                {
+                    firstDetection = fileResult;
+                }
+            }
+        }
+    } while (FindNextFileW(find, &findData));
+
+    FindClose(find);
 }
 
 struct HttpResponse
@@ -830,6 +1134,8 @@ void WINAPI ServiceMain(DWORD, LPWSTR*)
     EnableProcessCreationPrivileges();
     InitializeCriticalSection(&g_processLock);
     InitializeCriticalSection(&g_accountLock);
+    InitializeCriticalSection(&g_avLock);
+    LoadAvDatabases();
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_refreshEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_rpcReadyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -838,6 +1144,7 @@ void WINAPI ServiceMain(DWORD, LPWSTR*)
         SetServiceState(SERVICE_STOPPED, GetLastError());
         DeleteCriticalSection(&g_processLock);
         DeleteCriticalSection(&g_accountLock);
+        DeleteCriticalSection(&g_avLock);
         return;
     }
 
@@ -885,6 +1192,7 @@ void WINAPI ServiceMain(DWORD, LPWSTR*)
     CloseHandle(g_stopEvent);
     DeleteCriticalSection(&g_accountLock);
     DeleteCriticalSection(&g_processLock);
+    DeleteCriticalSection(&g_avLock);
     SetServiceState(SERVICE_STOPPED);
 }
 }
@@ -1009,8 +1317,69 @@ error_status_t RpcActivateProduct(handle_t, const wchar_t* activationCode, int* 
     *active = g_account.licenseActive ? 1 : 0;
     CopyRpcString(expiresAtUtc, expiresAtChars, g_account.licenseExpiresAtText);
     const error_status_t result = g_account.licenseActive ? RPC_S_OK : kNoLicense;
+    if (g_account.licenseActive)
+    {
+        LoadAvDatabases();
+    }
     LeaveCriticalSection(&g_accountLock);
     return result;
+}
+
+error_status_t RpcGetAvDatabaseInfo(handle_t, unsigned long* recordCount, wchar_t* releaseDateUtc, unsigned long releaseDateChars)
+{
+    EnterCriticalSection(&g_avLock);
+    *recordCount = static_cast<unsigned long>(AvRecordCountLocked());
+    CopyRpcString(releaseDateUtc, releaseDateChars, g_avDatabase.releaseDateUtc);
+    LeaveCriticalSection(&g_avLock);
+    return RPC_S_OK;
+}
+
+error_status_t RpcScanFile(handle_t, const wchar_t* path, int* infected, wchar_t* result, unsigned long resultChars)
+{
+    *infected = 0;
+    EnterCriticalSection(&g_accountLock);
+    const bool hasLicense = g_account.licenseActive && !g_account.licenseTicket.empty();
+    LeaveCriticalSection(&g_accountLock);
+    if (!hasLicense)
+    {
+        CopyRpcString(result, resultChars, L"Сканирование заблокировано: нет активной лицензии");
+        return kNoLicense;
+    }
+
+    std::wstring scanResult;
+    const bool detected = ScanSingleFile(path ? path : L"", scanResult);
+    *infected = detected ? 1 : 0;
+    CopyRpcString(result, resultChars, scanResult);
+    return RPC_S_OK;
+}
+
+error_status_t RpcScanDirectory(handle_t, const wchar_t* path, unsigned long* scannedFiles, unsigned long* infectedFiles, wchar_t* result, unsigned long resultChars)
+{
+    *scannedFiles = 0;
+    *infectedFiles = 0;
+    EnterCriticalSection(&g_accountLock);
+    const bool hasLicense = g_account.licenseActive && !g_account.licenseTicket.empty();
+    LeaveCriticalSection(&g_accountLock);
+    if (!hasLicense)
+    {
+        CopyRpcString(result, resultChars, L"Сканирование заблокировано: нет активной лицензии");
+        return kNoLicense;
+    }
+
+    DWORD scanned = 0;
+    DWORD infected = 0;
+    std::wstring firstDetection;
+    ScanDirectoryRecursive(path ? path : L"", scanned, infected, firstDetection);
+
+    *scannedFiles = scanned;
+    *infectedFiles = infected;
+    std::wstring summary = L"Проверено файлов: " + std::to_wstring(scanned) + L". Обнаружено угроз: " + std::to_wstring(infected) + L".";
+    if (!firstDetection.empty())
+    {
+        summary += L"\r\n" + firstDetection;
+    }
+    CopyRpcString(result, resultChars, summary);
+    return RPC_S_OK;
 }
 
 void* __RPC_USER midl_user_allocate(size_t size)
