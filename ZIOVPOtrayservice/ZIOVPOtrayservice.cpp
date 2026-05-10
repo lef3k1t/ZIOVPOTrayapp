@@ -423,6 +423,7 @@ std::vector<BYTE> BytesFromAscii(const char* text)
 }
 
 AvRecord MakeAvRecord(const char* signature, ULONGLONG offsetBegin, ULONGLONG offsetEnd, ObjectType objectType, const wchar_t* detectionName);
+size_t AvRecordCountLocked();
 
 std::vector<AvRecord> DefaultAvRecords()
 {
@@ -782,7 +783,7 @@ void LoadAvDatabases()
 {
     EnterCriticalSection(&g_avLock);
     LoadAvDatabaseFromDisk();
-    WriteDebugLog(L"AV databases active records=" + std::to_wstring(AvRecordCountLocked()));
+    WriteDebugLog(std::wstring(L"AV databases active records=") + std::to_wstring(static_cast<unsigned long long>(AvRecordCountLocked())));
     LeaveCriticalSection(&g_avLock);
 }
 
