@@ -1,17 +1,32 @@
 #include "ZIOVPOtrayapp.h"
+#include "ZIOVPOTrayRpc.h"
 
+#include <algorithm>
+#include <cstdlib>
+#include <cwctype>
 #include <string>
 
 namespace
 {
 constexpr UINT WM_TRAYICON = WM_APP + 1;
+constexpr UINT WM_REFRESH_FROM_SERVICE = WM_APP + 2;
 constexpr UINT ID_TRAY_OPEN = 1001;
 constexpr UINT ID_TRAY_EXIT = 1002;
 constexpr UINT ID_FILE_EXIT = 2001;
+constexpr UINT ID_LOGIN_BUTTON = 3001;
+constexpr UINT ID_ACTIVATE_BUTTON = 3002;
+constexpr UINT ID_LOGOUT_BUTTON = 3003;
+constexpr UINT ID_LICENSE_TIMER = 4001;
+constexpr UINT ID_TRAY_RETRY_TIMER = 4002;
 constexpr UINT TRAY_ICON_ID = 1;
+constexpr DWORD kNotAuthenticated = 12001;
+constexpr DWORD kNoLicense = 12002;
 
 const wchar_t kWindowClassName[] = L"ZIOVPOTrayAppWindowClass";
 const wchar_t kMutexName[] = L"Local\\ZIOVPOTrayAppSingleInstance";
+const wchar_t kServiceName[] = L"ZIOVPOTrayService";
+const wchar_t kServiceProcessName[] = L"ziovpotrayservice.exe";
+const wchar_t kRpcEndpoint[] = L"ZIOVPOTrayServiceRpc";
 
 HINSTANCE g_instance = nullptr;
 HWND g_mainWindow = nullptr;
@@ -19,6 +34,247 @@ HMENU g_mainMenu = nullptr;
 HMENU g_fileMenu = nullptr;
 UINT g_taskbarCreatedMessage = 0;
 bool g_isExiting = false;
+bool g_trayIconAdded = false;
+HWND g_statusLabel = nullptr;
+HWND g_loginEdit = nullptr;
+HWND g_passwordEdit = nullptr;
+HWND g_loginButton = nullptr;
+HWND g_activationEdit = nullptr;
+HWND g_activateButton = nullptr;
+HWND g_logoutButton = nullptr;
+std::wstring g_currentUser;
+
+std::wstring GetModuleDirectory()
+{
+    wchar_t path[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, path, ARRAYSIZE(path));
+    std::wstring fullPath = path;
+    const size_t slash = fullPath.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? L"." : fullPath.substr(0, slash);
+}
+
+void WriteDebugLog(const std::wstring& message)
+{
+    const std::wstring path = GetModuleDirectory() + L"\\TrayApp-debug.log";
+    HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+
+    SYSTEMTIME time{};
+    GetLocalTime(&time);
+    wchar_t line[2048]{};
+    swprintf_s(
+        line,
+        L"%04u-%02u-%02u %02u:%02u:%02u.%03u pid=%lu %s\r\n",
+        time.wYear,
+        time.wMonth,
+        time.wDay,
+        time.wHour,
+        time.wMinute,
+        time.wSecond,
+        time.wMilliseconds,
+        GetCurrentProcessId(),
+        message.c_str());
+
+    DWORD bytes = 0;
+    WriteFile(file, line, static_cast<DWORD>(wcslen(line) * sizeof(wchar_t)), &bytes, nullptr);
+    CloseHandle(file);
+}
+
+std::wstring ToLower(std::wstring value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t character) {
+        return static_cast<wchar_t>(towlower(character));
+    });
+    return value;
+}
+
+std::wstring FileNameFromPath(const std::wstring& path)
+{
+    const size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? path : path.substr(slash + 1);
+}
+
+DWORD GetParentProcessId()
+{
+    const DWORD currentProcessId = GetCurrentProcessId();
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE)
+    {
+        return 0;
+    }
+
+    PROCESSENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+    DWORD parentProcessId = 0;
+
+    if (Process32First(snapshot, &entry))
+    {
+        do
+        {
+            if (entry.th32ProcessID == currentProcessId)
+            {
+                parentProcessId = entry.th32ParentProcessID;
+                break;
+            }
+        } while (Process32Next(snapshot, &entry));
+    }
+
+    CloseHandle(snapshot);
+    return parentProcessId;
+}
+
+DWORD GetServiceProcessId()
+{
+    SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!manager)
+    {
+        WriteDebugLog(L"OpenSCManagerW failed: " + std::to_wstring(GetLastError()));
+        return 0;
+    }
+
+    SC_HANDLE service = OpenServiceW(manager, kServiceName, SERVICE_QUERY_STATUS);
+    if (!service)
+    {
+        WriteDebugLog(L"OpenServiceW(query) failed: " + std::to_wstring(GetLastError()));
+        CloseServiceHandle(manager);
+        return 0;
+    }
+
+    SERVICE_STATUS_PROCESS status{};
+    DWORD bytesNeeded = 0;
+    DWORD serviceProcessId = 0;
+    if (QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&status), sizeof(status), &bytesNeeded))
+    {
+        serviceProcessId = status.dwProcessId;
+    }
+    else
+    {
+        WriteDebugLog(L"QueryServiceStatusEx failed: " + std::to_wstring(GetLastError()));
+    }
+
+    CloseServiceHandle(service);
+    CloseServiceHandle(manager);
+    return serviceProcessId;
+}
+
+bool IsLaunchedByService()
+{
+    const DWORD parentProcessId = GetParentProcessId();
+    const DWORD serviceProcessId = GetServiceProcessId();
+    WriteDebugLog(L"Parent PID=" + std::to_wstring(parentProcessId) + L", service PID=" + std::to_wstring(serviceProcessId));
+    if (parentProcessId != 0 && serviceProcessId != 0 && parentProcessId == serviceProcessId)
+    {
+        WriteDebugLog(L"IsLaunchedByService: true by SCM pid");
+        return true;
+    }
+
+    if (parentProcessId == 0)
+    {
+        WriteDebugLog(L"IsLaunchedByService: false, no parent pid");
+        return false;
+    }
+
+    HANDLE parentProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parentProcessId);
+    if (!parentProcess)
+    {
+        WriteDebugLog(L"OpenProcess(parent) failed: " + std::to_wstring(GetLastError()));
+        return false;
+    }
+
+    wchar_t parentPath[MAX_PATH]{};
+    DWORD parentPathSize = ARRAYSIZE(parentPath);
+    const bool queried = QueryFullProcessImageNameW(parentProcess, 0, parentPath, &parentPathSize) != FALSE;
+    CloseHandle(parentProcess);
+
+    if (!queried)
+    {
+        WriteDebugLog(L"QueryFullProcessImageNameW(parent) failed: " + std::to_wstring(GetLastError()));
+        return false;
+    }
+
+    const bool result = ToLower(FileNameFromPath(parentPath)) == kServiceProcessName;
+    WriteDebugLog(std::wstring(L"IsLaunchedByService by parent path: ") + (result ? L"true" : L"false"));
+    return result;
+}
+
+bool WaitForServiceState(SC_HANDLE service, DWORD expectedState, DWORD timeoutMs)
+{
+    const DWORD startedAt = GetTickCount();
+    SERVICE_STATUS_PROCESS status{};
+    DWORD bytesNeeded = 0;
+
+    do
+    {
+        if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&status), sizeof(status), &bytesNeeded))
+        {
+            return false;
+        }
+
+        if (status.dwCurrentState == expectedState)
+        {
+            return true;
+        }
+
+        Sleep(250);
+    } while (GetTickCount() - startedAt < timeoutMs);
+
+    return false;
+}
+
+bool EnsureServiceRunningForCurrentLaunch(bool launchedByService)
+{
+    SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!manager)
+    {
+        WriteDebugLog(L"Ensure: OpenSCManagerW failed: " + std::to_wstring(GetLastError()));
+        return false;
+    }
+
+    const DWORD desiredAccess = launchedByService ? SERVICE_QUERY_STATUS : (SERVICE_QUERY_STATUS | SERVICE_START);
+    SC_HANDLE service = OpenServiceW(manager, kServiceName, desiredAccess);
+    if (!service)
+    {
+        WriteDebugLog(L"Ensure: OpenServiceW failed: " + std::to_wstring(GetLastError()));
+        CloseServiceHandle(manager);
+        return false;
+    }
+
+    SERVICE_STATUS_PROCESS status{};
+    DWORD bytesNeeded = 0;
+    bool shouldExit = false;
+
+    if (QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&status), sizeof(status), &bytesNeeded))
+    {
+        if (status.dwCurrentState == SERVICE_STOPPED)
+        {
+            if (!launchedByService)
+            {
+                const BOOL started = StartServiceW(service, 0, nullptr);
+                WriteDebugLog(L"Ensure: StartServiceW result=" + std::to_wstring(started) + L", error=" + std::to_wstring(GetLastError()));
+                WaitForServiceState(service, SERVICE_RUNNING, 30000);
+                shouldExit = true;
+            }
+        }
+        else if (status.dwCurrentState == SERVICE_START_PENDING)
+        {
+            const bool running = WaitForServiceState(service, SERVICE_RUNNING, 30000);
+            WriteDebugLog(std::wstring(L"Ensure: waited START_PENDING, running=") + (running ? L"true" : L"false"));
+            shouldExit = !launchedByService;
+        }
+    }
+    else
+    {
+        WriteDebugLog(L"Ensure: QueryServiceStatusEx failed: " + std::to_wstring(GetLastError()));
+    }
+
+    CloseServiceHandle(service);
+    CloseServiceHandle(manager);
+    WriteDebugLog(std::wstring(L"EnsureServiceRunningForCurrentLaunch returns ") + (shouldExit ? L"exit" : L"continue"));
+    return shouldExit;
+}
 
 bool IsHiddenStartupMode()
 {
@@ -49,7 +305,7 @@ void RemoveTrayIcon()
     Shell_NotifyIcon(NIM_DELETE, &data);
 }
 
-void AddTrayIcon()
+bool AddTrayIcon()
 {
     NOTIFYICONDATA data{};
     data.cbSize = sizeof(data);
@@ -60,9 +316,301 @@ void AddTrayIcon()
     data.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
     wcscpy_s(data.szTip, L"ZIOVPO Tray App");
 
-    Shell_NotifyIcon(NIM_ADD, &data);
+    const BOOL added = Shell_NotifyIcon(NIM_ADD, &data);
+    WriteDebugLog(L"Shell_NotifyIconW(NIM_ADD) result=" + std::to_wstring(added) + L", error=" + std::to_wstring(GetLastError()));
+    if (!added)
+    {
+        g_trayIconAdded = false;
+        SetTimer(g_mainWindow, ID_TRAY_RETRY_TIMER, 2000, nullptr);
+        return false;
+    }
+
     data.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIcon(NIM_SETVERSION, &data);
+    g_trayIconAdded = true;
+    KillTimer(g_mainWindow, ID_TRAY_RETRY_TIMER);
+    return true;
+}
+
+bool RequestServiceStop()
+{
+    RPC_WSTR bindingString = nullptr;
+    handle_t binding = nullptr;
+    RPC_STATUS status = RpcStringBindingComposeW(
+        nullptr,
+        reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(L"ncalrpc")),
+        nullptr,
+        reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(kRpcEndpoint)),
+        nullptr,
+        &bindingString);
+
+    if (status == RPC_S_OK)
+    {
+        status = RpcBindingFromStringBindingW(bindingString, &binding);
+    }
+
+    if (bindingString)
+    {
+        RpcStringFreeW(&bindingString);
+    }
+
+    if (status != RPC_S_OK)
+    {
+        return false;
+    }
+
+    RpcTryExcept
+    {
+        RpcStopService(binding);
+        status = RPC_S_OK;
+    }
+    RpcExcept(1)
+    {
+        status = RpcExceptionCode();
+    }
+    RpcEndExcept
+
+    RpcBindingFree(&binding);
+    return status == RPC_S_OK;
+}
+
+bool CreateRpcBinding(handle_t* binding)
+{
+    RPC_WSTR bindingString = nullptr;
+    RPC_STATUS status = RpcStringBindingComposeW(
+        nullptr,
+        reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(L"ncalrpc")),
+        nullptr,
+        reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(kRpcEndpoint)),
+        nullptr,
+        &bindingString);
+
+    if (status == RPC_S_OK)
+    {
+        status = RpcBindingFromStringBindingW(bindingString, binding);
+    }
+
+    if (bindingString)
+    {
+        RpcStringFreeW(&bindingString);
+    }
+
+    return status == RPC_S_OK;
+}
+
+void FreeRpcBinding(handle_t binding)
+{
+    if (binding)
+    {
+        RpcBindingFree(&binding);
+    }
+}
+
+void SetWindowTextSafe(HWND window, const std::wstring& text)
+{
+    if (window)
+    {
+        SetWindowTextW(window, text.c_str());
+    }
+}
+
+std::wstring GetControlText(HWND window)
+{
+    const int length = GetWindowTextLengthW(window);
+    std::wstring text(length + 1, L'\0');
+    GetWindowTextW(window, text.data(), static_cast<int>(text.size()));
+    text.resize(length);
+    return text;
+}
+
+void SetAuthControlsVisible(bool visible)
+{
+    const int command = visible ? SW_SHOW : SW_HIDE;
+    ShowWindow(g_loginEdit, command);
+    ShowWindow(g_passwordEdit, command);
+    ShowWindow(g_loginButton, command);
+}
+
+void SetActivationControlsVisible(bool visible)
+{
+    const int command = visible ? SW_SHOW : SW_HIDE;
+    ShowWindow(g_activationEdit, command);
+    ShowWindow(g_activateButton, command);
+}
+
+bool RpcGetUser(bool& authenticated, std::wstring& userName)
+{
+    handle_t binding = nullptr;
+    if (!CreateRpcBinding(&binding))
+    {
+        return false;
+    }
+
+    int rpcAuthenticated = 0;
+    wchar_t rpcUserName[256]{};
+    RPC_STATUS status = RPC_S_OK;
+    RpcTryExcept
+    {
+        status = RpcGetCurrentUser(binding, &rpcAuthenticated, rpcUserName, ARRAYSIZE(rpcUserName));
+    }
+    RpcExcept(1)
+    {
+        status = RpcExceptionCode();
+    }
+    RpcEndExcept
+
+    FreeRpcBinding(binding);
+    authenticated = rpcAuthenticated != 0;
+    userName = rpcUserName;
+    return status == RPC_S_OK;
+}
+
+DWORD RpcLoginUser(const std::wstring& userName, const std::wstring& password, bool& authenticated)
+{
+    handle_t binding = nullptr;
+    if (!CreateRpcBinding(&binding))
+    {
+        return RPC_S_SERVER_UNAVAILABLE;
+    }
+
+    int rpcAuthenticated = 0;
+    RPC_STATUS status = RPC_S_OK;
+    RpcTryExcept
+    {
+        status = RpcLogin(binding, userName.c_str(), password.c_str(), &rpcAuthenticated);
+    }
+    RpcExcept(1)
+    {
+        status = RpcExceptionCode();
+    }
+    RpcEndExcept
+
+    FreeRpcBinding(binding);
+    authenticated = rpcAuthenticated != 0;
+    return status;
+}
+
+void RpcLogoutUser()
+{
+    handle_t binding = nullptr;
+    if (!CreateRpcBinding(&binding))
+    {
+        return;
+    }
+
+    RpcTryExcept
+    {
+        RpcLogout(binding);
+    }
+    RpcExcept(1)
+    {
+    }
+    RpcEndExcept
+
+    FreeRpcBinding(binding);
+}
+
+DWORD RpcGetLicense(bool& active, std::wstring& expiresAt)
+{
+    handle_t binding = nullptr;
+    if (!CreateRpcBinding(&binding))
+    {
+        return RPC_S_SERVER_UNAVAILABLE;
+    }
+
+    int rpcActive = 0;
+    wchar_t rpcExpiresAt[128]{};
+    RPC_STATUS status = RPC_S_OK;
+    RpcTryExcept
+    {
+        status = RpcGetLicenseInfo(binding, &rpcActive, rpcExpiresAt, ARRAYSIZE(rpcExpiresAt));
+    }
+    RpcExcept(1)
+    {
+        status = RpcExceptionCode();
+    }
+    RpcEndExcept
+
+    FreeRpcBinding(binding);
+    active = rpcActive != 0;
+    expiresAt = rpcExpiresAt;
+    return status;
+}
+
+DWORD RpcActivateLicense(const std::wstring& code, bool& active, std::wstring& expiresAt)
+{
+    handle_t binding = nullptr;
+    if (!CreateRpcBinding(&binding))
+    {
+        return RPC_S_SERVER_UNAVAILABLE;
+    }
+
+    int rpcActive = 0;
+    wchar_t rpcExpiresAt[128]{};
+    RPC_STATUS status = RPC_S_OK;
+    RpcTryExcept
+    {
+        status = RpcActivateProduct(binding, code.c_str(), &rpcActive, rpcExpiresAt, ARRAYSIZE(rpcExpiresAt));
+    }
+    RpcExcept(1)
+    {
+        status = RpcExceptionCode();
+    }
+    RpcEndExcept
+
+    FreeRpcBinding(binding);
+    active = rpcActive != 0;
+    expiresAt = rpcExpiresAt;
+    return status;
+}
+
+void RefreshAccountUi()
+{
+    WriteDebugLog(L"RefreshAccountUi begin");
+    bool authenticated = false;
+    std::wstring userName;
+    if (!RpcGetUser(authenticated, userName) || !authenticated)
+    {
+        WriteDebugLog(L"RefreshAccountUi: not authenticated or RPC failed");
+        g_currentUser.clear();
+        SetWindowTextSafe(g_statusLabel, L"Пользователь не вошел. Функции антивируса заблокированы.");
+        SetAuthControlsVisible(true);
+        SetActivationControlsVisible(false);
+        return;
+    }
+
+    g_currentUser = userName;
+    SetAuthControlsVisible(false);
+
+    bool licenseActive = false;
+    std::wstring expiresAt;
+    const DWORD licenseStatus = RpcGetLicense(licenseActive, expiresAt);
+    if (licenseStatus == RPC_S_OK && licenseActive)
+    {
+        WriteDebugLog(L"RefreshAccountUi: license active");
+        SetActivationControlsVisible(false);
+        SetWindowTextSafe(g_statusLabel, L"Пользователь: " + g_currentUser + L"\r\nЛицензия активна до: " + expiresAt + L"\r\nФункции антивируса разблокированы.");
+        return;
+    }
+
+    SetActivationControlsVisible(true);
+    WriteDebugLog(L"RefreshAccountUi: no active license");
+    SetWindowTextSafe(g_statusLabel, L"Пользователь: " + g_currentUser + L"\r\nЛицензия отсутствует. Функции антивируса заблокированы.");
+}
+
+void CreateAccountControls()
+{
+    g_statusLabel = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT, 24, 36, 560, 80, g_mainWindow, nullptr, g_instance, nullptr);
+    CreateWindowW(L"STATIC", L"Логин:", WS_CHILD | WS_VISIBLE, 24, 136, 80, 22, g_mainWindow, nullptr, g_instance, nullptr);
+    g_loginEdit = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 112, 132, 220, 26, g_mainWindow, nullptr, g_instance, nullptr);
+    CreateWindowW(L"STATIC", L"Пароль:", WS_CHILD | WS_VISIBLE, 24, 172, 80, 22, g_mainWindow, nullptr, g_instance, nullptr);
+    g_passwordEdit = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_PASSWORD | ES_AUTOHSCROLL, 112, 168, 220, 26, g_mainWindow, nullptr, g_instance, nullptr);
+    g_loginButton = CreateWindowW(L"BUTTON", L"Войти", WS_CHILD | WS_VISIBLE, 352, 150, 120, 30, g_mainWindow, reinterpret_cast<HMENU>(ID_LOGIN_BUTTON), g_instance, nullptr);
+
+    CreateWindowW(L"STATIC", L"Код активации:", WS_CHILD | WS_VISIBLE, 24, 226, 120, 22, g_mainWindow, nullptr, g_instance, nullptr);
+    g_activationEdit = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 152, 222, 220, 26, g_mainWindow, nullptr, g_instance, nullptr);
+    g_activateButton = CreateWindowW(L"BUTTON", L"Активировать", WS_CHILD | WS_VISIBLE, 392, 220, 140, 30, g_mainWindow, reinterpret_cast<HMENU>(ID_ACTIVATE_BUTTON), g_instance, nullptr);
+    g_logoutButton = CreateWindowW(L"BUTTON", L"Выйти из аккаунта", WS_CHILD | WS_VISIBLE, 24, 300, 180, 30, g_mainWindow, reinterpret_cast<HMENU>(ID_LOGOUT_BUTTON), g_instance, nullptr);
 }
 
 void ExitApplication()
@@ -112,12 +660,17 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
 {
     if (message == g_taskbarCreatedMessage)
     {
+        g_trayIconAdded = false;
         AddTrayIcon();
         return 0;
     }
 
     switch (message)
     {
+    case WM_REFRESH_FROM_SERVICE:
+        RefreshAccountUi();
+        return 0;
+
     case WM_TRAYICON:
         if (LOWORD(lParam) == WM_LBUTTONUP)
         {
@@ -137,11 +690,63 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
             return 0;
         case ID_TRAY_EXIT:
         case ID_FILE_EXIT:
-            ExitApplication();
+            if (!RequestServiceStop())
+            {
+                ExitApplication();
+            }
+            return 0;
+        case ID_LOGIN_BUTTON:
+        {
+            bool authenticated = false;
+            const DWORD result = RpcLoginUser(GetControlText(g_loginEdit), GetControlText(g_passwordEdit), authenticated);
+            if (result != RPC_S_OK || !authenticated)
+            {
+                SetWindowTextSafe(g_statusLabel, L"Ошибка входа. Проверьте логин и пароль.");
+                SetAuthControlsVisible(true);
+                SetActivationControlsVisible(false);
+            }
+            else
+            {
+                RefreshAccountUi();
+            }
+            return 0;
+        }
+        case ID_ACTIVATE_BUTTON:
+        {
+            bool active = false;
+            std::wstring expiresAt;
+            const DWORD result = RpcActivateLicense(GetControlText(g_activationEdit), active, expiresAt);
+            if (result != RPC_S_OK || !active)
+            {
+                SetWindowTextSafe(g_statusLabel, L"Ошибка активации. Введите корректный код активации.");
+                SetActivationControlsVisible(true);
+            }
+            else
+            {
+                RefreshAccountUi();
+            }
+            return 0;
+        }
+        case ID_LOGOUT_BUTTON:
+            RpcLogoutUser();
+            RefreshAccountUi();
             return 0;
         default:
             return 0;
         }
+
+    case WM_TIMER:
+        if (wParam == ID_LICENSE_TIMER)
+        {
+            RefreshAccountUi();
+            return 0;
+        }
+        if (wParam == ID_TRAY_RETRY_TIMER)
+        {
+            AddTrayIcon();
+            return 0;
+        }
+        break;
 
     case WM_CLOSE:
         if (g_isExiting)
@@ -164,6 +769,8 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
     default:
         return DefWindowProc(window, message, wParam, lParam);
     }
+
+    return DefWindowProc(window, message, wParam, lParam);
 }
 
 bool RegisterMainWindowClass()
@@ -199,12 +806,36 @@ bool CreateMainWindow()
         g_instance,
         nullptr);
 
-    return g_mainWindow != nullptr;
+    if (!g_mainWindow)
+    {
+        return false;
+    }
+
+    CreateAccountControls();
+    SetTimer(g_mainWindow, ID_LICENSE_TIMER, 30000, nullptr);
+    PostMessageW(g_mainWindow, WM_REFRESH_FROM_SERVICE, 0, 0);
+    return true;
 }
 }
 
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
 {
+    WriteDebugLog(L"wWinMain entered");
+    const bool launchedByService = IsLaunchedByService();
+    WriteDebugLog(std::wstring(L"IsLaunchedByService result=") + (launchedByService ? L"true" : L"false"));
+
+    if (EnsureServiceRunningForCurrentLaunch(launchedByService))
+    {
+        WriteDebugLog(L"Exiting because this manual launch started or waited for service");
+        return 0;
+    }
+
+    if (!launchedByService)
+    {
+        WriteDebugLog(L"Exiting because parent is not service");
+        return 0;
+    }
+
     HANDLE singleInstanceMutex = CreateMutex(nullptr, TRUE, kMutexName);
     if (!singleInstanceMutex || GetLastError() == ERROR_ALREADY_EXISTS)
     {
@@ -220,6 +851,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
 
     if (!RegisterMainWindowClass() || !CreateMainWindow())
     {
+        WriteDebugLog(L"CreateWindow/RegisterClass failed: " + std::to_wstring(GetLastError()));
         CloseHandle(singleInstanceMutex);
         return 1;
     }
@@ -240,4 +872,14 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
 
     CloseHandle(singleInstanceMutex);
     return static_cast<int>(message.wParam);
+}
+
+void* __RPC_USER midl_user_allocate(size_t size)
+{
+    return malloc(size);
+}
+
+void __RPC_USER midl_user_free(void* pointer)
+{
+    free(pointer);
 }

@@ -12,32 +12,40 @@ add_custom_command(
   VERBATIM
 )
 
-add_executable(ZIOVPOtrayapp WIN32
-  "ZIOVPOtrayapp.cpp"
-  "ZIOVPOtrayapp.h"
+add_executable(ZIOVPOtrayservice
+  "ZIOVPOtrayservice.cpp"
+  "ZIOVPOtrayservice.h"
   "${RPC_HEADER}"
-  "${RPC_CLIENT_STUB}"
+  "${RPC_SERVER_STUB}"
 )
 
 if (CMAKE_VERSION VERSION_GREATER 3.12)
-  set_property(TARGET ZIOVPOtrayapp PROPERTY CXX_STANDARD 20)
+  set_property(TARGET ZIOVPOtrayservice PROPERTY CXX_STANDARD 20)
 endif()
 
-target_compile_definitions(ZIOVPOtrayapp PRIVATE UNICODE _UNICODE)
-target_include_directories(ZIOVPOtrayapp PRIVATE "${RPC_OUTPUT_DIR}")
+target_compile_definitions(ZIOVPOtrayservice PRIVATE
+  UNICODE
+  _UNICODE
+  WINVER=0x0601
+  _WIN32_WINNT=0x0601
+)
+target_include_directories(ZIOVPOtrayservice PRIVATE "${RPC_OUTPUT_DIR}")
 
 if (MSVC)
-  target_compile_options(ZIOVPOtrayapp PRIVATE /utf-8)
-  set_property(TARGET ZIOVPOtrayapp PROPERTY
+  target_compile_options(ZIOVPOtrayservice PRIVATE /utf-8)
+  set_property(TARGET ZIOVPOtrayservice PROPERTY
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-target_link_libraries(ZIOVPOtrayapp PRIVATE
+target_link_libraries(ZIOVPOtrayservice PRIVATE
   advapi32
+  crypt32
+  iphlpapi
   rpcrt4
-  user32
-  shell32
-  gdi32
+  userenv
+  winhttp
+  ws2_32
+  wtsapi32
 )
 
-install(TARGETS ZIOVPOtrayapp RUNTIME DESTINATION .)
+install(TARGETS ZIOVPOtrayservice RUNTIME DESTINATION .)
