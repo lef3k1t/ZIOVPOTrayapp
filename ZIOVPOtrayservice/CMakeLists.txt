@@ -33,6 +33,8 @@ target_include_directories(ZIOVPOtrayservice PRIVATE "${RPC_OUTPUT_DIR}")
 
 if (MSVC)
   target_compile_options(ZIOVPOtrayservice PRIVATE /utf-8)
+  set_property(TARGET ZIOVPOtrayservice PROPERTY
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
 target_link_libraries(ZIOVPOtrayservice PRIVATE

@@ -22,6 +22,7 @@ SERVICE_STATUS_HANDLE g_statusHandle = nullptr;
 SERVICE_STATUS g_status{};
 HANDLE g_stopEvent = nullptr;
 HANDLE g_refreshEvent = nullptr;
+HANDLE g_rpcReadyEvent = nullptr;
 CRITICAL_SECTION g_processLock{};
 CRITICAL_SECTION g_accountLock{};
 std::vector<PROCESS_INFORMATION> g_trayProcesses;
@@ -41,6 +42,45 @@ struct AccountState
 };
 
 AccountState g_account;
+
+std::wstring GetModuleDirectory()
+{
+    wchar_t path[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, path, ARRAYSIZE(path));
+    std::wstring fullPath = path;
+    const size_t slash = fullPath.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? L"." : fullPath.substr(0, slash);
+}
+
+void WriteDebugLog(const std::wstring& message)
+{
+    const std::wstring path = GetModuleDirectory() + L"\\TrayAppService-debug.log";
+    HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+
+    SYSTEMTIME time{};
+    GetLocalTime(&time);
+    wchar_t line[2048]{};
+    swprintf_s(
+        line,
+        L"%04u-%02u-%02u %02u:%02u:%02u.%03u pid=%lu %s\r\n",
+        time.wYear,
+        time.wMonth,
+        time.wDay,
+        time.wHour,
+        time.wMinute,
+        time.wSecond,
+        time.wMilliseconds,
+        GetCurrentProcessId(),
+        message.c_str());
+
+    DWORD bytes = 0;
+    WriteFile(file, line, static_cast<DWORD>(wcslen(line) * sizeof(wchar_t)), &bytes, nullptr);
+    CloseHandle(file);
+}
 
 std::wstring GetEnvOrDefault(const wchar_t* name, const wchar_t* fallback)
 {
@@ -308,6 +348,7 @@ struct HttpResponse
 
 bool SendHttpsJson(const std::wstring& url, const wchar_t* method, const std::string& body, const std::wstring& bearerToken, HttpResponse& response)
 {
+    WriteDebugLog(L"HTTP request: " + std::wstring(method) + L" " + url);
     URL_COMPONENTS components{};
     components.dwStructSize = sizeof(components);
     components.dwSchemeLength = static_cast<DWORD>(-1);
@@ -393,6 +434,7 @@ bool SendHttpsJson(const std::wstring& url, const wchar_t* method, const std::st
         WinHttpCloseHandle(connection);
     }
     WinHttpCloseHandle(session);
+    WriteDebugLog(L"HTTP response status=" + std::to_wstring(response.statusCode));
     return ok;
 }
 
@@ -515,6 +557,7 @@ void SetServiceState(DWORD state, DWORD win32ExitCode = NO_ERROR, DWORD waitHint
     {
         SetServiceStatus(g_statusHandle, &g_status);
     }
+    WriteDebugLog(L"SetServiceState state=" + std::to_wstring(state) + L", error=" + std::to_wstring(win32ExitCode));
 }
 
 std::wstring GetServiceDirectory()
@@ -565,20 +608,24 @@ void CleanupExitedTrayProcesses()
 
 void StartTrayForSession(DWORD sessionId)
 {
+    WriteDebugLog(L"StartTrayForSession sessionId=" + std::to_wstring(sessionId));
     if (sessionId == 0 || HasTrayInSession(sessionId))
     {
+        WriteDebugLog(L"StartTrayForSession skipped");
         return;
     }
 
     HANDLE userToken = nullptr;
     if (!WTSQueryUserToken(sessionId, &userToken))
     {
+        WriteDebugLog(L"WTSQueryUserToken failed: " + std::to_wstring(GetLastError()));
         return;
     }
 
     HANDLE primaryToken = nullptr;
     if (!DuplicateTokenEx(userToken, MAXIMUM_ALLOWED, nullptr, SecurityImpersonation, TokenPrimary, &primaryToken))
     {
+        WriteDebugLog(L"DuplicateTokenEx failed: " + std::to_wstring(GetLastError()));
         CloseHandle(userToken);
         return;
     }
@@ -589,6 +636,7 @@ void StartTrayForSession(DWORD sessionId)
     const std::wstring serviceDirectory = GetServiceDirectory();
     const std::wstring trayPath = serviceDirectory + L"\\" + kTrayProcessName;
     std::wstring commandLine = L"\"" + trayPath + L"\" --hidden --service-child";
+    WriteDebugLog(L"CreateProcessAsUserW path=" + trayPath);
 
     STARTUPINFO startupInfo{};
     startupInfo.cb = sizeof(startupInfo);
@@ -617,18 +665,25 @@ void StartTrayForSession(DWORD sessionId)
 
     if (created)
     {
+        WriteDebugLog(L"CreateProcessAsUserW success pid=" + std::to_wstring(processInfo.dwProcessId));
         EnterCriticalSection(&g_processLock);
         g_trayProcesses.push_back(processInfo);
         LeaveCriticalSection(&g_processLock);
+    }
+    else
+    {
+        WriteDebugLog(L"CreateProcessAsUserW failed: " + std::to_wstring(GetLastError()));
     }
 }
 
 void StartTrayForActiveSessions()
 {
+    WriteDebugLog(L"StartTrayForActiveSessions");
     PWTS_SESSION_INFO sessions = nullptr;
     DWORD sessionCount = 0;
     if (!WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &sessions, &sessionCount))
     {
+        WriteDebugLog(L"WTSEnumerateSessionsW failed: " + std::to_wstring(GetLastError()));
         return;
     }
 
@@ -643,6 +698,7 @@ void StartTrayForActiveSessions()
     WTSFreeMemory(sessions);
 
     const DWORD consoleSessionId = WTSGetActiveConsoleSessionId();
+    WriteDebugLog(L"Active console session=" + std::to_wstring(consoleSessionId));
     if (consoleSessionId != 0 && consoleSessionId != 0xFFFFFFFF)
     {
         StartTrayForSession(consoleSessionId);
@@ -704,6 +760,7 @@ DWORD WINAPI AccountRefreshThread(void*)
 
 DWORD WINAPI RpcServerThread(void*)
 {
+    WriteDebugLog(L"RPC server thread starting");
     RPC_STATUS status = RpcServerUseProtseqEpW(
         reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(L"ncalrpc")),
         RPC_C_PROTSEQ_MAX_REQS_DEFAULT,
@@ -712,6 +769,7 @@ DWORD WINAPI RpcServerThread(void*)
 
     if (status != RPC_S_OK && status != RPC_S_DUPLICATE_ENDPOINT)
     {
+        WriteDebugLog(L"RpcServerUseProtseqEpW failed: " + std::to_wstring(status));
         SetEvent(g_stopEvent);
         return status;
     }
@@ -719,19 +777,24 @@ DWORD WINAPI RpcServerThread(void*)
     status = RpcServerRegisterIf(ZIOVPOTrayRpc_v1_0_s_ifspec, nullptr, nullptr);
     if (status != RPC_S_OK)
     {
+        WriteDebugLog(L"RpcServerRegisterIf failed: " + std::to_wstring(status));
         SetEvent(g_stopEvent);
         return status;
     }
 
-    status = RpcServerListen(1, RPC_C_LISTEN_MAX_CALLS_DEFAULT, FALSE);
+    status = RpcServerListen(1, RPC_C_LISTEN_MAX_CALLS_DEFAULT, TRUE);
     if (status != RPC_S_OK && status != RPC_S_ALREADY_LISTENING && status != RPC_S_SERVER_TOO_BUSY)
     {
+        WriteDebugLog(L"RpcServerListen failed: " + std::to_wstring(status));
         SetEvent(g_stopEvent);
         return status;
     }
 
+    WriteDebugLog(L"RPC server is listening");
+    SetEvent(g_rpcReadyEvent);
     RpcMgmtWaitServerListen();
     RpcServerUnregisterIf(ZIOVPOTrayRpc_v1_0_s_ifspec, nullptr, FALSE);
+    WriteDebugLog(L"RPC server stopped listening");
     SetEvent(g_stopEvent);
     return 0;
 }
@@ -756,6 +819,7 @@ DWORD WINAPI ServiceControlHandler(DWORD control, DWORD eventType, void* eventDa
 
 void WINAPI ServiceMain(DWORD, LPWSTR*)
 {
+    WriteDebugLog(L"ServiceMain entered");
     g_statusHandle = RegisterServiceCtrlHandlerExW(kServiceName, ServiceControlHandler, nullptr);
     if (!g_statusHandle)
     {
@@ -768,7 +832,8 @@ void WINAPI ServiceMain(DWORD, LPWSTR*)
     InitializeCriticalSection(&g_accountLock);
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_refreshEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!g_stopEvent || !g_refreshEvent)
+    g_rpcReadyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_stopEvent || !g_refreshEvent || !g_rpcReadyEvent)
     {
         SetServiceState(SERVICE_STOPPED, GetLastError());
         DeleteCriticalSection(&g_processLock);
@@ -777,11 +842,20 @@ void WINAPI ServiceMain(DWORD, LPWSTR*)
     }
 
     HANDLE rpcThread = CreateThread(nullptr, 0, RpcServerThread, nullptr, 0, nullptr);
+    if (!rpcThread)
+    {
+        WriteDebugLog(L"CreateThread(RPC) failed: " + std::to_wstring(GetLastError()));
+        SetServiceState(SERVICE_STOPPED, GetLastError());
+        return;
+    }
+
+    WaitForSingleObject(g_rpcReadyEvent, 10000);
+    SetServiceState(SERVICE_RUNNING);
+
     HANDLE monitorThread = CreateThread(nullptr, 0, SessionMonitorThread, nullptr, 0, nullptr);
     HANDLE accountThread = CreateThread(nullptr, 0, AccountRefreshThread, nullptr, 0, nullptr);
 
     StartTrayForActiveSessions();
-    SetServiceState(SERVICE_RUNNING);
 
     WaitForSingleObject(g_stopEvent, INFINITE);
     SetServiceState(SERVICE_STOP_PENDING, NO_ERROR, 3000);
@@ -806,6 +880,7 @@ void WINAPI ServiceMain(DWORD, LPWSTR*)
     }
 
     StopAllTrayProcesses();
+    CloseHandle(g_rpcReadyEvent);
     CloseHandle(g_refreshEvent);
     CloseHandle(g_stopEvent);
     DeleteCriticalSection(&g_accountLock);
