@@ -9,7 +9,15 @@ if (POLICY CMP0141)
   set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<IF:$<AND:$<C_COMPILER_ID:MSVC>,$<CXX_COMPILER_ID:MSVC>>,$<$<CONFIG:Debug,RelWithDebInfo>:EditAndContinue>,$<$<CONFIG:Debug,RelWithDebInfo>:ProgramDatabase>>")
 endif()
 
+if (POLICY CMP0091)
+  cmake_policy(SET CMP0091 NEW)
+endif()
+
 project ("ZIOVPOtrayapp")
+
+set(ZIOVPO_DEFAULT_AVDB "${CMAKE_SOURCE_DIR}/assets/avdb-default.bin")
 
 # Включите подпроекты.
 add_subdirectory ("ZIOVPOtrayapp")
+add_subdirectory ("ZIOVPOtrayservice")
+add_subdirectory ("installer")

@@ -23,16 +23,54 @@ jobs:
       - name: Install artifact layout
         run: cmake --install build --config Release --prefix artifact
 
+      - name: Build installer package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path installer-package | Out-Null
+          Copy-Item artifact/ZIOVPOtrayinstaller.exe installer-package/
+          Copy-Item artifact/ZIOVPOtrayapp.exe installer-package/
+          Copy-Item artifact/ZIOVPOtrayservice.exe installer-package/
+          Copy-Item artifact/avdb-default.bin installer-package/
+          Copy-Item installer/install.ps1 installer-package/
+          Copy-Item installer/uninstall.ps1 installer-package/
+          Copy-Item installer/README.md installer-package/
+          Compress-Archive -Path installer-package/* -DestinationPath artifact/ZIOVPOtrayapp-installer.zip -Force
+
       - name: Verify exe artifact
         shell: pwsh
         run: |
           if (!(Test-Path "artifact/ZIOVPOtrayapp.exe")) {
             throw "artifact/ZIOVPOtrayapp.exe was not produced"
           }
+          if (!(Test-Path "artifact/ZIOVPOtrayservice.exe")) {
+            throw "artifact/ZIOVPOtrayservice.exe was not produced"
+          }
+          if (!(Test-Path "artifact/ZIOVPOtrayinstaller.exe")) {
+            throw "artifact/ZIOVPOtrayinstaller.exe was not produced"
+          }
+          if (!(Test-Path "artifact/avdb-default.bin")) {
+            throw "artifact/avdb-default.bin was not produced"
+          }
+          if (!(Test-Path "artifact/ZIOVPOtrayapp-installer.zip")) {
+            throw "artifact/ZIOVPOtrayapp-installer.zip was not produced"
+          }
 
       - name: Upload exe artifact
         uses: actions/upload-artifact@v4
         with:
           name: ZIOVPOtrayapp-windows-x64
-          path: artifact/ZIOVPOtrayapp.exe
+          path: |
+            artifact/ZIOVPOtrayapp.exe
+            artifact/ZIOVPOtrayservice.exe
+            artifact/ZIOVPOtrayinstaller.exe
+            artifact/avdb-default.bin
+          if-no-files-found: error
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZIOVPOtrayapp-installer
+          path: |
+            artifact/ZIOVPOtrayapp-installer.zip
+            artifact/ZIOVPOtrayinstaller.exe
           if-no-files-found: error
