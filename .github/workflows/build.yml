@@ -29,10 +29,19 @@ jobs:
           if (!(Test-Path "artifact/ZIOVPOtrayapp.exe")) {
             throw "artifact/ZIOVPOtrayapp.exe was not produced"
           }
+          if (!(Test-Path "artifact/ZIOVPOtrayservice.exe")) {
+            throw "artifact/ZIOVPOtrayservice.exe was not produced"
+          }
+          if (!(Test-Path "artifact/avdb-default.bin")) {
+            throw "artifact/avdb-default.bin was not produced"
+          }
 
       - name: Upload exe artifact
         uses: actions/upload-artifact@v4
         with:
           name: ZIOVPOtrayapp-windows-x64
-          path: artifact/ZIOVPOtrayapp.exe
+          path: |
+            artifact/ZIOVPOtrayapp.exe
+            artifact/ZIOVPOtrayservice.exe
+            artifact/avdb-default.bin
           if-no-files-found: error

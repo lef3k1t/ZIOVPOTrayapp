@@ -1,0 +1,55 @@
+[
+    uuid(7f8a2e9f-9e41-470a-8dc8-6a10f9ad2f22),
+    version(1.0)
+]
+interface ZIOVPOTrayRpc
+{
+    void RpcStopService([in] handle_t binding);
+    error_status_t RpcGetCurrentUser(
+        [in] handle_t binding,
+        [out] int* authenticated,
+        [out, string, size_is(userNameChars)] wchar_t* userName,
+        [in] unsigned long userNameChars);
+
+    error_status_t RpcLogin(
+        [in] handle_t binding,
+        [in, string] const wchar_t* userName,
+        [in, string] const wchar_t* password,
+        [out] int* authenticated);
+
+    void RpcLogout([in] handle_t binding);
+
+    error_status_t RpcGetLicenseInfo(
+        [in] handle_t binding,
+        [out] int* active,
+        [out, string, size_is(expiresAtChars)] wchar_t* expiresAtUtc,
+        [in] unsigned long expiresAtChars);
+
+    error_status_t RpcActivateProduct(
+        [in] handle_t binding,
+        [in, string] const wchar_t* activationCode,
+        [out] int* active,
+        [out, string, size_is(expiresAtChars)] wchar_t* expiresAtUtc,
+        [in] unsigned long expiresAtChars);
+
+    error_status_t RpcGetAvDatabaseInfo(
+        [in] handle_t binding,
+        [out] unsigned long* recordCount,
+        [out, string, size_is(releaseDateChars)] wchar_t* releaseDateUtc,
+        [in] unsigned long releaseDateChars);
+
+    error_status_t RpcScanFile(
+        [in] handle_t binding,
+        [in, string] const wchar_t* path,
+        [out] int* infected,
+        [out, string, size_is(resultChars)] wchar_t* result,
+        [in] unsigned long resultChars);
+
+    error_status_t RpcScanDirectory(
+        [in] handle_t binding,
+        [in, string] const wchar_t* path,
+        [out] unsigned long* scannedFiles,
+        [out] unsigned long* infectedFiles,
+        [out, string, size_is(resultChars)] wchar_t* result,
+        [in] unsigned long resultChars);
+}
