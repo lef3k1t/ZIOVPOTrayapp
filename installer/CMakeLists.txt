@@ -1,4 +1,4 @@
-add_executable(ZIOVPOtrayinstaller
+add_executable(ZIOVPOtrayinstaller WIN32
   "ZIOVPOtrayinstaller.cpp"
 )
 
